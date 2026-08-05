@@ -1,1 +1,140 @@
+name: Generate satellite tiles
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tile generator
+        run: pip install requests rio-tiler
+
+      - name: Generate static WebP tiles
+        shell: bash
+        run: |
+          cat > /tmp/generate_tiles.py <<'PY'
+          from pathlib import Path
+          import json, math, sys
+          import requests
+          from rio_tiler.io import COGReader
+
+          STAC = "https://earth-search.aws.element84.com/v1"
+          COLLECTION = "sentinel-2-l2a"
+          SCENES = {
+              "before": "S2A_36RXV_20230927_0_L2A",
+              "after": "S2A_36RXV_20260804_0_L2A",
+          }
+
+          # Gaza-only extent keeps the repository reasonably small.
+          BBOX = (34.30, 31.38, 34.53, 31.61)
+          ZOOMS = range(8, 16)
+          OUT = Path("tiles")
+
+          def get_item(scene_id):
+              url = f"{STAC}/collections/{COLLECTION}/items/{scene_id}"
+              response = requests.get(url, timeout=60)
+              response.raise_for_status()
+              return response.json()
+
+          def visual_href(feature):
+              assets = feature.get("assets", {})
+              for key in ("visual", "tci", "TCI", "visual-jp2"):
+                  if key in assets:
+                      return assets[key]["href"]
+              raise RuntimeError(f"No true-colour asset in {feature.get('id')}")
+
+          def lon_to_x(lon, zoom):
+              return int((lon + 180.0) / 360.0 * (1 << zoom))
+
+          def lat_to_y(lat, zoom):
+              lat_radians = math.radians(lat)
+              return int(
+                  (1.0 - math.asinh(math.tan(lat_radians)) / math.pi)
+                  / 2.0
+                  * (1 << zoom)
+              )
+
+          def tile_coordinates():
+              west, south, east, north = BBOX
+              for zoom in ZOOMS:
+                  x0, x1 = lon_to_x(west, zoom), lon_to_x(east, zoom)
+                  y0, y1 = lat_to_y(north, zoom), lat_to_y(south, zoom)
+                  for x in range(x0, x1 + 1):
+                      for y in range(y0, y1 + 1):
+                          yield zoom, x, y
+
+          def generate(label, href):
+              coordinates = list(tile_coordinates())
+              print(f"{label}: generating {len(coordinates)} tiles")
+
+              with COGReader(href) as cog:
+                  for number, (zoom, x, y) in enumerate(coordinates, 1):
+                      path = OUT / label / str(zoom) / str(x) / f"{y}.webp"
+
+                      if path.exists() and path.stat().st_size > 100:
+                          continue
+
+                      path.parent.mkdir(parents=True, exist_ok=True)
+
+                      try:
+                          image = cog.tile(x, y, zoom, tilesize=256)
+                          path.write_bytes(
+                              image.render(img_format="WEBP", quality=80)
+                          )
+                      except Exception as error:
+                          print(
+                              f"Skipped {zoom}/{x}/{y}: {error}",
+                              file=sys.stderr,
+                          )
+
+                      if number % 50 == 0:
+                          print(f"{label}: {number}/{len(coordinates)}")
+
+          def main():
+              OUT.mkdir(exist_ok=True)
+              manifest = {}
+
+              for label, scene_id in SCENES.items():
+                  feature = get_item(scene_id)
+                  href = visual_href(feature)
+
+                  manifest[label] = {
+                      "id": scene_id,
+                      "datetime": feature["properties"].get("datetime"),
+                      "href": href,
+                  }
+
+                  generate(label, href)
+
+              (OUT / "manifest.json").write_text(
+                  json.dumps(manifest, indent=2),
+                  encoding="utf-8",
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python /tmp/generate_tiles.py
+
+      - name: Commit generated tiles
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tiles
+          git diff --cached --quiet && exit 0
+          git commit -m "Generate static satellite tiles"
+          git push
