@@ -1,4 +1,4 @@
-name: Generate satellite tiles
+name: Generate three satellite tile sets
 
 on:
   workflow_dispatch:
@@ -10,131 +10,105 @@ jobs:
   generate:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install tile generator
-        run: pip install requests rio-tiler
-
-      - name: Generate static WebP tiles
+      - run: pip install requests rio-tiler
+      - name: Generate before, newest and season-matched tiles
         shell: bash
         run: |
-          cat > /tmp/generate_tiles.py <<'PY'
+          cat > /tmp/generate.py <<'PY'
           from pathlib import Path
-          import json, math, sys
-          import requests
+          import json, math, sys, requests
+          from datetime import datetime, timezone
           from rio_tiler.io import COGReader
 
-          STAC = "https://earth-search.aws.element84.com/v1"
-          COLLECTION = "sentinel-2-l2a"
-          SCENES = {
-              "before": "S2A_36RXV_20230927_0_L2A",
-              "after": "S2A_36RXV_20260804_0_L2A",
-          }
+          SEARCH="https://earth-search.aws.element84.com/v1/search"
+          ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
+          BBOX=(34.30,31.38,34.53,31.61)
+          ZOOMS=range(8,16)
+          OUT=Path("tiles")
+          BEFORE_ID="S2A_36RXV_20230927_0_L2A"
 
-          # Gaza-only extent keeps the repository reasonably small.
-          BBOX = (34.30, 31.38, 34.53, 31.61)
-          ZOOMS = range(8, 16)
-          OUT = Path("tiles")
+          def get_item(item_id):
+              r=requests.get(f"{ITEM}/{item_id}",timeout=60);r.raise_for_status();return r.json()
 
-          def get_item(scene_id):
-              url = f"{STAC}/collections/{COLLECTION}/items/{scene_id}"
-              response = requests.get(url, timeout=60)
-              response.raise_for_status()
-              return response.json()
+          def search(start,end,limit=100):
+              params={"collections":"sentinel-2-l2a","bbox":",".join(map(str,BBOX)),
+                      "datetime":f"{start}/{end}","limit":str(limit)}
+              r=requests.get(SEARCH,params=params,timeout=60);r.raise_for_status()
+              return r.json().get("features",[])
 
-          def visual_href(feature):
-              assets = feature.get("assets", {})
-              for key in ("visual", "tci", "TCI", "visual-jp2"):
-                  if key in assets:
-                      return assets[key]["href"]
-              raise RuntimeError(f"No true-colour asset in {feature.get('id')}")
+          def visual(item):
+              for k in ("visual","tci","TCI","visual-jp2"):
+                  if k in item.get("assets",{}): return item["assets"][k]["href"]
+              return None
 
-          def lon_to_x(lon, zoom):
-              return int((lon + 180.0) / 360.0 * (1 << zoom))
+          def cloud(item): return float(item.get("properties",{}).get("eo:cloud_cover",999))
+          def dt(item): return item["properties"].get("datetime") or item["properties"].get("start_datetime")
 
-          def lat_to_y(lat, zoom):
-              lat_radians = math.radians(lat)
-              return int(
-                  (1.0 - math.asinh(math.tan(lat_radians)) / math.pi)
-                  / 2.0
-                  * (1 << zoom)
-              )
+          def choose_latest(items):
+              valid=[i for i in items if visual(i)]
+              valid.sort(key=lambda i:(cloud(i)*5, -datetime.fromisoformat(dt(i).replace("Z","+00:00")).timestamp()))
+              return valid[0]
 
-          def tile_coordinates():
-              west, south, east, north = BBOX
-              for zoom in ZOOMS:
-                  x0, x1 = lon_to_x(west, zoom), lon_to_x(east, zoom)
-                  y0, y1 = lat_to_y(north, zoom), lat_to_y(south, zoom)
-                  for x in range(x0, x1 + 1):
-                      for y in range(y0, y1 + 1):
-                          yield zoom, x, y
+          def choose_seasonal(items):
+              valid=[i for i in items if visual(i)]
+              target_day=270
+              def score(i):
+                  d=datetime.fromisoformat(dt(i).replace("Z","+00:00"))
+                  return cloud(i)*5 + abs(d.timetuple().tm_yday-target_day)
+              valid.sort(key=score)
+              return valid[0]
 
-          def generate(label, href):
-              coordinates = list(tile_coordinates())
-              print(f"{label}: generating {len(coordinates)} tiles")
+          def lonx(lon,z): return int((lon+180)/360*(1<<z))
+          def laty(lat,z):
+              r=math.radians(lat)
+              return int((1-math.asinh(math.tan(r))/math.pi)/2*(1<<z))
 
+          def coords():
+              w,s,e,n=BBOX
+              for z in ZOOMS:
+                  for x in range(lonx(w,z),lonx(e,z)+1):
+                      for y in range(laty(n,z),laty(s,z)+1):
+                          yield z,x,y
+
+          def render(label,item):
+              href=visual(item); alltiles=list(coords())
               with COGReader(href) as cog:
-                  for number, (zoom, x, y) in enumerate(coordinates, 1):
-                      path = OUT / label / str(zoom) / str(x) / f"{y}.webp"
-
-                      if path.exists() and path.stat().st_size > 100:
-                          continue
-
-                      path.parent.mkdir(parents=True, exist_ok=True)
-
+                  for n,(z,x,y) in enumerate(alltiles,1):
+                      p=OUT/label/str(z)/str(x)/f"{y}.webp"
+                      if p.exists() and p.stat().st_size>100: continue
+                      p.parent.mkdir(parents=True,exist_ok=True)
                       try:
-                          image = cog.tile(x, y, zoom, tilesize=256)
-                          path.write_bytes(
-                              image.render(img_format="WEBP", quality=80)
-                          )
-                      except Exception as error:
-                          print(
-                              f"Skipped {zoom}/{x}/{y}: {error}",
-                              file=sys.stderr,
-                          )
+                          img=cog.tile(x,y,z,tilesize=256)
+                          p.write_bytes(img.render(img_format="WEBP",quality=80))
+                      except Exception as e:
+                          print(f"skip {label} {z}/{x}/{y}: {e}",file=sys.stderr)
+                      if n%100==0: print(label,n,len(alltiles))
 
-                      if number % 50 == 0:
-                          print(f"{label}: {number}/{len(coordinates)}")
+          before=get_item(BEFORE_ID)
+          latest=choose_latest(search("2025-01-01T00:00:00Z","2026-08-05T23:59:59Z"))
+          seasonal=choose_seasonal(search("2025-08-23T00:00:00Z","2025-11-01T23:59:59Z"))
 
-          def main():
-              OUT.mkdir(exist_ok=True)
-              manifest = {}
-
-              for label, scene_id in SCENES.items():
-                  feature = get_item(scene_id)
-                  href = visual_href(feature)
-
-                  manifest[label] = {
-                      "id": scene_id,
-                      "datetime": feature["properties"].get("datetime"),
-                      "href": href,
-                  }
-
-                  generate(label, href)
-
-              (OUT / "manifest.json").write_text(
-                  json.dumps(manifest, indent=2),
-                  encoding="utf-8",
-              )
-
-          if __name__ == "__main__":
-              main()
+          scenes={"before":before,"latest":latest,"seasonal":seasonal}
+          OUT.mkdir(exist_ok=True)
+          manifest={}
+          for label,item in scenes.items():
+              render(label,item)
+              manifest[label]={"id":item["id"],"datetime":dt(item),"cloud":cloud(item),"href":visual(item)}
+          (OUT/"manifest.json").write_text(json.dumps(manifest,indent=2))
+          print(json.dumps(manifest,indent=2))
           PY
-
-          python /tmp/generate_tiles.py
-
+          python /tmp/generate.py
       - name: Commit generated tiles
-        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tiles
           git diff --cached --quiet && exit 0
-          git commit -m "Generate static satellite tiles"
+          git commit -m "Generate three satellite tile sets"
           git push
+          
