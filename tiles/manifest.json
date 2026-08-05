@@ -2,11 +2,19 @@
   "before": {
     "id": "S2A_36RXV_20230927_0_L2A",
     "datetime": "2023-09-27T08:31:34.055000Z",
+    "cloud": 0.381913,
     "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/XV/2023/9/S2A_36RXV_20230927_0_L2A/TCI.tif"
   },
-  "after": {
+  "latest": {
     "id": "S2A_36RXV_20260804_0_L2A",
     "datetime": "2026-08-04T08:31:49.215000Z",
+    "cloud": 0.002167,
     "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/XV/2026/8/S2A_36RXV_20260804_0_L2A/TCI.tif"
+  },
+  "seasonal": {
+    "id": "S2A_36RXV_20250928_0_L2A",
+    "datetime": "2025-09-28T08:31:47.235000Z",
+    "cloud": 0.502407,
+    "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/XV/2025/9/S2A_36RXV_20250928_0_L2A/TCI.tif"
   }
 }
