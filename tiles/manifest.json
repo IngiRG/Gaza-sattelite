@@ -1,0 +1,12 @@
+{
+  "before": {
+    "id": "S2A_36RXV_20230927_0_L2A",
+    "datetime": "2023-09-27T08:31:34.055000Z",
+    "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/XV/2023/9/S2A_36RXV_20230927_0_L2A/TCI.tif"
+  },
+  "after": {
+    "id": "S2A_36RXV_20260804_0_L2A",
+    "datetime": "2026-08-04T08:31:49.215000Z",
+    "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/XV/2026/8/S2A_36RXV_20260804_0_L2A/TCI.tif"
+  }
+}
