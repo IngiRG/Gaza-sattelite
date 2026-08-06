@@ -11,262 +11,95 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
-
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install tile generator
-        run: pip install requests rio-tiler pillow numpy shapely
-
-      - name: Generate monthly tiles with simple corner fallback
+        run: pip install requests rio-tiler
+      - name: Generate monthly tiles
         shell: bash
         run: |
           cat > /tmp/generate_monthly.py <<'PY'
-          from contextlib import ExitStack
-          from datetime import datetime, timezone
           from pathlib import Path
-          import calendar, json, math, shutil
-          import numpy as np
-          import requests
-          from PIL import Image
+          from datetime import datetime, timezone
+          import calendar, json, math, shutil, sys, requests
           from rio_tiler.io import COGReader
-          from shapely.geometry import box, shape
 
-          SEARCH = "https://earth-search.aws.element84.com/v1/search"
-          COLLECTION = "sentinel-2-l2a"
-          BEFORE_ID = "S2A_36RXV_20230927_0_L2A"
-          BBOX = (34.22, 31.30, 34.60, 31.67)
-          ZOOMS = range(8, 15)
-          OUT = Path("tiles")
-          MANIFEST = OUT / "manifest.json"
-          AOI = box(*BBOX)
-
-          session = requests.Session()
-          session.headers.update({
-              "Accept": "application/geo+json,application/json",
-              "User-Agent": "gaza-monthly-timeline-simple-fallback/1.0",
-          })
-
-          def visual(item):
-              assets = item.get("assets", {})
-              for key in ("visual", "tci", "TCI", "visual-jp2"):
-                  asset = assets.get(key)
-                  if asset and asset.get("href"):
-                      return asset["href"]
-              return None
-
-          def item_datetime(item):
-              p = item.get("properties", {})
-              return p.get("datetime") or p.get("start_datetime")
-
-          def cloud(item):
-              try:
-                  return float(item.get("properties", {}).get("eo:cloud_cover", 999))
-              except (TypeError, ValueError):
-                  return 999.0
+          SEARCH="https://earth-search.aws.element84.com/v1/search"
+          ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
+          BEFORE_ID="S2A_36RXV_20230927_0_L2A"
+          BBOX=(34.22,31.30,34.60,31.67)
+          ZOOMS=range(8,15)
+          OUT=Path("tiles")
 
           def get_item(item_id):
-              url = f"https://earth-search.aws.element84.com/v1/collections/{COLLECTION}/items/{item_id}"
-              r = session.get(url, timeout=90)
-              r.raise_for_status()
-              return r.json()
-
-          def search_month(year, month):
-              final_day = calendar.monthrange(year, month)[1]
-              params = {
-                  "collections": COLLECTION,
-                  "bbox": ",".join(map(str, BBOX)),
-                  "datetime": f"{year:04d}-{month:02d}-01T00:00:00Z/{year:04d}-{month:02d}-{final_day:02d}T23:59:59Z",
-                  "limit": "100",
-              }
-              r = session.get(SEARCH, params=params, timeout=120)
-              r.raise_for_status()
-              output = []
-              for item in r.json().get("features", []):
-                  if not visual(item) or not item.get("geometry"):
-                      continue
-                  try:
-                      if shape(item["geometry"]).intersects(AOI):
-                          output.append(item)
-                  except Exception:
-                      continue
-              return output
-
-          def intersection(item):
-              try:
-                  return shape(item["geometry"]).intersection(AOI)
-              except Exception:
-                  return None
-
-          def choose_primary_and_backup(items):
-              if not items:
-                  raise RuntimeError("No usable Sentinel-2 scenes found")
-              ordered = sorted(items, key=lambda i: (cloud(i), item_datetime(i) or ""))
-              primary = ordered[0]
-              primary_geom = intersection(primary)
-              uncovered = AOI.difference(primary_geom) if primary_geom is not None else AOI
-              backup = None
-              best = None
-              for candidate in ordered[1:]:
-                  geom = intersection(candidate)
-                  if geom is None:
-                      continue
-                  score = (geom.intersection(uncovered).area, -cloud(candidate))
-                  if best is None or score > best:
-                      best = score
-                      backup = candidate
-              return primary, backup
-
-          def lon_to_x(lon, z):
-              return int((lon + 180.0) / 360.0 * (1 << z))
-
-          def lat_to_y(lat, z):
-              r = math.radians(lat)
-              return int((1.0 - math.asinh(math.tan(r)) / math.pi) / 2.0 * (1 << z))
-
-          def tile_coordinates():
-              west, south, east, north = BBOX
-              for z in ZOOMS:
-                  for x in range(lon_to_x(west, z), lon_to_x(east, z) + 1):
-                      for y in range(lat_to_y(north, z), lat_to_y(south, z) + 1):
-                          yield z, x, y
-
-          TILE_COORDINATES = list(tile_coordinates())
-
-          def read_tile(reader, x, y, z):
-              if reader is None:
-                  return None, None
-              try:
-                  image = reader.tile(x, y, z, tilesize=256)
-              except Exception:
-                  return None, None
-              data = np.asarray(image.data)
-              if data.ndim == 2:
-                  data = data[np.newaxis, :, :]
-              if data.shape[0] == 1:
-                  data = np.repeat(data, 3, axis=0)
-              elif data.shape[0] > 3:
-                  data = data[:3]
-              data = np.clip(data, 0, 255).astype(np.uint8)
-              mask = np.asarray(image.mask)
-              if mask.ndim == 3:
-                  mask = mask[0]
-              return data, mask > 0
-
-          def render_tile(primary_reader, backup_reader, x, y, z):
-              rgb = np.zeros((3, 256, 256), dtype=np.uint8)
-              valid = np.zeros((256, 256), dtype=bool)
-              pdata, pvalid = read_tile(primary_reader, x, y, z)
-              if pdata is not None:
-                  rgb[:, pvalid] = pdata[:, pvalid]
-                  valid |= pvalid
-              if not np.all(valid):
-                  bdata, bvalid = read_tile(backup_reader, x, y, z)
-                  if bdata is not None:
-                      take = bvalid & ~valid
-                      rgb[:, take] = bdata[:, take]
-                      valid |= take
-              rgba = np.zeros((256, 256, 4), dtype=np.uint8)
-              rgba[:, :, :3] = np.moveaxis(rgb, 0, 2)
-              rgba[:, :, 3] = valid.astype(np.uint8) * 255
-              return rgba, valid
-
-          def load_manifest():
-              if not MANIFEST.exists():
-                  return {}
-              try:
-                  return json.loads(MANIFEST.read_text(encoding="utf-8"))
-              except Exception:
-                  return {}
-
-          def previous_primary_id(previous):
-              return previous.get("primary_id") or previous.get("id")
-
-          def render_folder(label, primary, backup, previous):
-              destination = OUT / label
-              primary_id = primary["id"]
-              backup_id = backup["id"] if backup else None
-              if destination.exists() and previous_primary_id(previous) != primary_id:
-                  shutil.rmtree(destination)
-              destination.mkdir(parents=True, exist_ok=True)
-              generated = reused = transparent = 0
-              with ExitStack() as stack:
-                  primary_reader = stack.enter_context(COGReader(visual(primary)))
-                  backup_reader = stack.enter_context(COGReader(visual(backup))) if backup else None
-                  for z, x, y in TILE_COORDINATES:
-                      path = destination / str(z) / str(x) / f"{y}.webp"
-                      if path.exists() and path.stat().st_size > 100:
-                          reused += 1
-                          continue
-                      rgba, valid = render_tile(primary_reader, backup_reader, x, y, z)
-                      if not np.any(valid):
-                          transparent += 1
-                      path.parent.mkdir(parents=True, exist_ok=True)
-                      Image.fromarray(rgba).save(path, "WEBP", quality=80, method=4)
-                      generated += 1
-              print(f"{label}: generated={generated}, reused={reused}, transparent={transparent}")
-              return {
-                  "id": primary_id,
-                  "primary_id": primary_id,
-                  "backup_id": backup_id,
-                  "datetime": item_datetime(primary),
-                  "cloud": cloud(primary),
-                  "bbox": list(BBOX),
-                  "zooms": [min(ZOOMS), max(ZOOMS)],
-                  "simple_fallback": True,
-              }
-
+              r=requests.get(f"{ITEM}/{item_id}",timeout=90);r.raise_for_status();return r.json()
+          def search_month(year,month):
+              last=calendar.monthrange(year,month)[1]
+              params={"collections":"sentinel-2-l2a","bbox":",".join(map(str,BBOX)),"datetime":f"{year:04d}-{month:02d}-01T00:00:00Z/{year:04d}-{month:02d}-{last:02d}T23:59:59Z","limit":"100"}
+              r=requests.get(SEARCH,params=params,timeout=90);r.raise_for_status();return r.json().get("features",[])
+          def visual(item):
+              for key in ("visual","tci","TCI","visual-jp2"):
+                  if key in item.get("assets",{}): return item["assets"][key]["href"]
+              return None
+          def cloud(item): return float(item.get("properties",{}).get("eo:cloud_cover",999))
+          def dt(item): return item["properties"].get("datetime") or item["properties"].get("start_datetime")
+          def choose_month(items):
+              valid=[item for item in items if visual(item)]
+              if not valid:return None
+              valid.sort(key=lambda item:(cloud(item),dt(item)))
+              return valid[0]
           def month_keys():
-              current = datetime.now(timezone.utc)
-              year, month = 2023, 10
-              while (year, month) <= (current.year, current.month):
-                  yield f"{year:04d}-{month:02d}", year, month
-                  month += 1
-                  if month == 13:
-                      year += 1
-                      month = 1
+              now=datetime.now(timezone.utc);year,month=2023,10
+              while (year,month)<=(now.year,now.month):
+                  yield f"{year:04d}-{month:02d}",year,month
+                  month+=1
+                  if month==13:year+=1;month=1
+          def lonx(lon,z): return int((lon+180)/360*(1<<z))
+          def laty(lat,z):
+              radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
+          def coords():
+              west,south,east,north=BBOX
+              for z in ZOOMS:
+                  for x in range(lonx(west,z),lonx(east,z)+1):
+                      for y in range(laty(north,z),laty(south,z)+1):yield z,x,y
+          TILE_COORDS=list(coords())
+          def render(label,item,force=False):
+              folder=OUT/label
+              if force and folder.exists():shutil.rmtree(folder)
+              with COGReader(visual(item)) as cog:
+                  for number,(z,x,y) in enumerate(TILE_COORDS,1):
+                      path=folder/str(z)/str(x)/f"{y}.webp"
+                      if path.exists() and path.stat().st_size>100:continue
+                      path.parent.mkdir(parents=True,exist_ok=True)
+                      try:path.write_bytes(cog.tile(x,y,z,tilesize=256).render(img_format="WEBP",quality=78))
+                      except Exception as error:print(f"skip {label} {z}/{x}/{y}: {error}",file=sys.stderr)
+                      if number%100==0:print(label,number,len(TILE_COORDS))
 
-          def main():
-              OUT.mkdir(exist_ok=True)
-              old = load_manifest()
-              before_primary = get_item(BEFORE_ID)
-              before_result = render_folder("before", before_primary, None, old.get("before", {}))
-              manifest = {
-                  "generated_at": datetime.now(timezone.utc).isoformat(),
-                  "bbox": list(BBOX),
-                  "zooms": [min(ZOOMS), max(ZOOMS)],
-                  "before": before_result,
-                  "months": {},
-              }
-              for key, year, month in month_keys():
-                  print("Processing", key)
-                  primary, backup = choose_primary_and_backup(search_month(year, month))
-                  result = render_folder(
-                      f"monthly/{key}",
-                      primary,
-                      backup,
-                      old.get("months", {}).get(key, {}),
-                  )
-                  manifest["months"][key] = result
-                  MANIFEST.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-              MANIFEST.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-          if __name__ == "__main__":
-              main()
+          OUT.mkdir(exist_ok=True);manifest_path=OUT/"manifest.json";old_manifest={}
+          if manifest_path.exists():
+              try:old_manifest=json.loads(manifest_path.read_text())
+              except Exception:old_manifest={}
+          before=get_item(BEFORE_ID);render("before",before,force=old_manifest.get("before",{}).get("id")!=before["id"])
+          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
+          for key,year,month in month_keys():
+              selected=choose_month(search_month(year,month))
+              if selected is None:continue
+              previous=old_manifest.get("months",{}).get(key,{})
+              render(f"monthly/{key}",selected,force=previous.get("id")!=selected["id"])
+              manifest["months"][key]={"id":selected["id"],"datetime":dt(selected),"cloud":cloud(selected),"href":visual(selected)}
+              manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+          manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
           PY
-
           python /tmp/generate_monthly.py
-
       - name: Commit generated timeline
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tiles
           git diff --cached --quiet && exit 0
-          git commit -m "Repair missing monthly satellite tiles"
+          git commit -m "Update monthly satellite timeline"
           git push
