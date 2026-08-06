@@ -1,7 +1,9 @@
-name: Generate three satellite tile sets
+name: Generate monthly satellite timeline
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 3 3 * *"
 
 permissions:
   contents: write
@@ -9,106 +11,95 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests rio-tiler
-      - name: Generate before, newest and season-matched tiles
+      - name: Install tile generator
+        run: pip install requests rio-tiler
+      - name: Generate monthly tiles
         shell: bash
         run: |
-          cat > /tmp/generate.py <<'PY'
+          cat > /tmp/generate_monthly.py <<'PY'
           from pathlib import Path
-          import json, math, sys, requests
           from datetime import datetime, timezone
+          import calendar, json, math, shutil, sys, requests
           from rio_tiler.io import COGReader
 
           SEARCH="https://earth-search.aws.element84.com/v1/search"
           ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
-          BBOX = (34.18, 31.26, 34.64, 31.71)
-          ZOOMS=range(8,16)
-          OUT=Path("tiles")
           BEFORE_ID="S2A_36RXV_20230927_0_L2A"
+          BBOX=(34.22,31.30,34.60,31.67)
+          ZOOMS=range(8,15)
+          OUT=Path("tiles")
 
           def get_item(item_id):
-              r=requests.get(f"{ITEM}/{item_id}",timeout=60);r.raise_for_status();return r.json()
-
-          def search(start,end,limit=100):
-              params={"collections":"sentinel-2-l2a","bbox":",".join(map(str,BBOX)),
-                      "datetime":f"{start}/{end}","limit":str(limit)}
-              r=requests.get(SEARCH,params=params,timeout=60);r.raise_for_status()
-              return r.json().get("features",[])
-
+              r=requests.get(f"{ITEM}/{item_id}",timeout=90);r.raise_for_status();return r.json()
+          def search_month(year,month):
+              last=calendar.monthrange(year,month)[1]
+              params={"collections":"sentinel-2-l2a","bbox":",".join(map(str,BBOX)),"datetime":f"{year:04d}-{month:02d}-01T00:00:00Z/{year:04d}-{month:02d}-{last:02d}T23:59:59Z","limit":"100"}
+              r=requests.get(SEARCH,params=params,timeout=90);r.raise_for_status();return r.json().get("features",[])
           def visual(item):
-              for k in ("visual","tci","TCI","visual-jp2"):
-                  if k in item.get("assets",{}): return item["assets"][k]["href"]
+              for key in ("visual","tci","TCI","visual-jp2"):
+                  if key in item.get("assets",{}): return item["assets"][key]["href"]
               return None
-
           def cloud(item): return float(item.get("properties",{}).get("eo:cloud_cover",999))
           def dt(item): return item["properties"].get("datetime") or item["properties"].get("start_datetime")
-
-          def choose_latest(items):
-              valid=[i for i in items if visual(i)]
-              valid.sort(key=lambda i:(cloud(i)*5, -datetime.fromisoformat(dt(i).replace("Z","+00:00")).timestamp()))
+          def choose_month(items):
+              valid=[item for item in items if visual(item)]
+              if not valid:return None
+              valid.sort(key=lambda item:(cloud(item),dt(item)))
               return valid[0]
-
-          def choose_seasonal(items):
-              valid=[i for i in items if visual(i)]
-              target_day=270
-              def score(i):
-                  d=datetime.fromisoformat(dt(i).replace("Z","+00:00"))
-                  return cloud(i)*5 + abs(d.timetuple().tm_yday-target_day)
-              valid.sort(key=score)
-              return valid[0]
-
+          def month_keys():
+              now=datetime.now(timezone.utc);year,month=2023,10
+              while (year,month)<=(now.year,now.month):
+                  yield f"{year:04d}-{month:02d}",year,month
+                  month+=1
+                  if month==13:year+=1;month=1
           def lonx(lon,z): return int((lon+180)/360*(1<<z))
           def laty(lat,z):
-              r=math.radians(lat)
-              return int((1-math.asinh(math.tan(r))/math.pi)/2*(1<<z))
-
+              radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
           def coords():
-              w,s,e,n=BBOX
+              west,south,east,north=BBOX
               for z in ZOOMS:
-                  for x in range(lonx(w,z),lonx(e,z)+1):
-                      for y in range(laty(n,z),laty(s,z)+1):
-                          yield z,x,y
+                  for x in range(lonx(west,z),lonx(east,z)+1):
+                      for y in range(laty(north,z),laty(south,z)+1):yield z,x,y
+          TILE_COORDS=list(coords())
+          def render(label,item,force=False):
+              folder=OUT/label
+              if force and folder.exists():shutil.rmtree(folder)
+              with COGReader(visual(item)) as cog:
+                  for number,(z,x,y) in enumerate(TILE_COORDS,1):
+                      path=folder/str(z)/str(x)/f"{y}.webp"
+                      if path.exists() and path.stat().st_size>100:continue
+                      path.parent.mkdir(parents=True,exist_ok=True)
+                      try:path.write_bytes(cog.tile(x,y,z,tilesize=256).render(img_format="WEBP",quality=78))
+                      except Exception as error:print(f"skip {label} {z}/{x}/{y}: {error}",file=sys.stderr)
+                      if number%100==0:print(label,number,len(TILE_COORDS))
 
-          def render(label,item):
-              href=visual(item); alltiles=list(coords())
-              with COGReader(href) as cog:
-                  for n,(z,x,y) in enumerate(alltiles,1):
-                      p=OUT/label/str(z)/str(x)/f"{y}.webp"
-                      if p.exists() and p.stat().st_size>100: continue
-                      p.parent.mkdir(parents=True,exist_ok=True)
-                      try:
-                          img=cog.tile(x,y,z,tilesize=256)
-                          p.write_bytes(img.render(img_format="WEBP",quality=80))
-                      except Exception as e:
-                          print(f"skip {label} {z}/{x}/{y}: {e}",file=sys.stderr)
-                      if n%100==0: print(label,n,len(alltiles))
-
-          before=get_item(BEFORE_ID)
-          latest=choose_latest(search("2025-01-01T00:00:00Z","2026-08-05T23:59:59Z"))
-          seasonal=choose_seasonal(search("2025-08-23T00:00:00Z","2025-11-01T23:59:59Z"))
-
-          scenes={"before":before,"latest":latest,"seasonal":seasonal}
-          OUT.mkdir(exist_ok=True)
-          manifest={}
-          for label,item in scenes.items():
-              render(label,item)
-              manifest[label]={"id":item["id"],"datetime":dt(item),"cloud":cloud(item),"href":visual(item)}
-          (OUT/"manifest.json").write_text(json.dumps(manifest,indent=2))
-          print(json.dumps(manifest,indent=2))
+          OUT.mkdir(exist_ok=True);manifest_path=OUT/"manifest.json";old_manifest={}
+          if manifest_path.exists():
+              try:old_manifest=json.loads(manifest_path.read_text())
+              except Exception:old_manifest={}
+          before=get_item(BEFORE_ID);render("before",before,force=old_manifest.get("before",{}).get("id")!=before["id"])
+          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
+          for key,year,month in month_keys():
+              selected=choose_month(search_month(year,month))
+              if selected is None:continue
+              previous=old_manifest.get("months",{}).get(key,{})
+              render(f"monthly/{key}",selected,force=previous.get("id")!=selected["id"])
+              manifest["months"][key]={"id":selected["id"],"datetime":dt(selected),"cloud":cloud(selected),"href":visual(selected)}
+              manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+          manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
           PY
-          python /tmp/generate.py
-      - name: Commit generated tiles
+          python /tmp/generate_monthly.py
+      - name: Commit generated timeline
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tiles
           git diff --cached --quiet && exit 0
-          git commit -m "Generate three satellite tile sets"
+          git commit -m "Update monthly satellite timeline"
           git push
-          
