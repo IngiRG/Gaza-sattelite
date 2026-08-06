@@ -61,11 +61,17 @@ jobs:
           def lonx(lon,z): return int((lon+180)/360*(1<<z))
           def laty(lat,z):
               radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
+          TILE_PADDING=1
           def coords():
               west,south,east,north=BBOX
               for z in ZOOMS:
-                  for x in range(lonx(west,z),lonx(east,z)+1):
-                      for y in range(laty(north,z),laty(south,z)+1):yield z,x,y
+                  x0=lonx(west,z)-TILE_PADDING
+                  x1=lonx(east,z)+TILE_PADDING
+                  y0=laty(north,z)-TILE_PADDING
+                  y1=laty(south,z)+TILE_PADDING
+                  for x in range(x0,x1+1):
+                      for y in range(y0,y1+1):
+                          yield z,x,y
           TILE_COORDS=list(coords())
           def render(label,item,force=False):
               folder=OUT/label
