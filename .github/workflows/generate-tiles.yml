@@ -11,95 +11,502 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install tile generator
-        run: pip install requests rio-tiler
-      - name: Generate monthly tiles
+        run: pip install requests rio-tiler shapely pillow numpy
+
+      - name: Generate gap-free monthly mosaics
         shell: bash
         run: |
           cat > /tmp/generate_monthly.py <<'PY'
           from pathlib import Path
           from datetime import datetime, timezone
-          import calendar, json, math, shutil, sys, requests
+          import calendar
+          import json
+          import math
+          import shutil
+          import sys
+
+          import numpy as np
+          import requests
+          from PIL import Image
           from rio_tiler.io import COGReader
+          from shapely.geometry import box, shape
+          from shapely.ops import unary_union
 
-          SEARCH="https://earth-search.aws.element84.com/v1/search"
-          ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
-          BEFORE_ID="S2A_36RXV_20230927_0_L2A"
-          BBOX=(34.22,31.30,34.60,31.67)
-          ZOOMS=range(8,15)
-          OUT=Path("tiles")
+          SEARCH = "https://earth-search.aws.element84.com/v1/search"
+          COLLECTION = "sentinel-2-l2a"
 
-          def get_item(item_id):
-              r=requests.get(f"{ITEM}/{item_id}",timeout=90);r.raise_for_status();return r.json()
-          def search_month(year,month):
-              last=calendar.monthrange(year,month)[1]
-              params={"collections":"sentinel-2-l2a","bbox":",".join(map(str,BBOX)),"datetime":f"{year:04d}-{month:02d}-01T00:00:00Z/{year:04d}-{month:02d}-{last:02d}T23:59:59Z","limit":"100"}
-              r=requests.get(SEARCH,params=params,timeout=90);r.raise_for_status();return r.json().get("features",[])
+          BEFORE_DATE = "2023-09-27"
+
+          # west, south, east, north
+          BBOX = (34.22, 31.30, 34.60, 31.67)
+
+          # Zoom 8–14. Change to range(8, 16) for zoom 15, but repository
+          # size and generation time will increase substantially.
+          ZOOMS = range(8, 15)
+
+          OUT = Path("tiles")
+          BUILD = OUT / ".build"
+          MANIFEST_PATH = OUT / "manifest.json"
+          GENERATOR_VERSION = 2
+
+          AOI = box(*BBOX)
+
+          session = requests.Session()
+          session.headers.update({
+              "Accept": "application/geo+json,application/json",
+              "User-Agent": "gaza-monthly-timeline/2.0",
+          })
+
           def visual(item):
-              for key in ("visual","tci","TCI","visual-jp2"):
-                  if key in item.get("assets",{}): return item["assets"][key]["href"]
+              assets = item.get("assets", {})
+              for key in ("visual", "tci", "TCI", "visual-jp2"):
+                  asset = assets.get(key)
+                  if asset and asset.get("href"):
+                      return asset["href"]
               return None
-          def cloud(item): return float(item.get("properties",{}).get("eo:cloud_cover",999))
-          def dt(item): return item["properties"].get("datetime") or item["properties"].get("start_datetime")
-          def choose_month(items):
-              valid=[item for item in items if visual(item)]
-              if not valid:return None
-              valid.sort(key=lambda item:(cloud(item),dt(item)))
-              return valid[0]
-          def month_keys():
-              now=datetime.now(timezone.utc);year,month=2023,10
-              while (year,month)<=(now.year,now.month):
-                  yield f"{year:04d}-{month:02d}",year,month
-                  month+=1
-                  if month==13:year+=1;month=1
-          def lonx(lon,z): return int((lon+180)/360*(1<<z))
-          def laty(lat,z):
-              radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
-          def coords():
-              west,south,east,north=BBOX
-              for z in ZOOMS:
-                  for x in range(lonx(west,z),lonx(east,z)+1):
-                      for y in range(laty(north,z),laty(south,z)+1):yield z,x,y
-          TILE_COORDS=list(coords())
-          def render(label,item,force=False):
-              folder=OUT/label
-              if force and folder.exists():shutil.rmtree(folder)
-              with COGReader(visual(item)) as cog:
-                  for number,(z,x,y) in enumerate(TILE_COORDS,1):
-                      path=folder/str(z)/str(x)/f"{y}.webp"
-                      if path.exists() and path.stat().st_size>100:continue
-                      path.parent.mkdir(parents=True,exist_ok=True)
-                      try:path.write_bytes(cog.tile(x,y,z,tilesize=256).render(img_format="WEBP",quality=78))
-                      except Exception as error:print(f"skip {label} {z}/{x}/{y}: {error}",file=sys.stderr)
-                      if number%100==0:print(label,number,len(TILE_COORDS))
 
-          OUT.mkdir(exist_ok=True);manifest_path=OUT/"manifest.json";old_manifest={}
-          if manifest_path.exists():
-              try:old_manifest=json.loads(manifest_path.read_text())
-              except Exception:old_manifest={}
-          before=get_item(BEFORE_ID);render("before",before,force=old_manifest.get("before",{}).get("id")!=before["id"])
-          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
-          for key,year,month in month_keys():
-              selected=choose_month(search_month(year,month))
-              if selected is None:continue
-              previous=old_manifest.get("months",{}).get(key,{})
-              render(f"monthly/{key}",selected,force=previous.get("id")!=selected["id"])
-              manifest["months"][key]={"id":selected["id"],"datetime":dt(selected),"cloud":cloud(selected),"href":visual(selected)}
-              manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
-          manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+          def item_datetime(item):
+              props = item.get("properties", {})
+              return props.get("datetime") or props.get("start_datetime")
+
+          def cloud(item):
+              value = item.get("properties", {}).get("eo:cloud_cover")
+              try:
+                  return float(value)
+              except (TypeError, ValueError):
+                  return 999.0
+
+          def search_range(start, end):
+              params = {
+                  "collections": COLLECTION,
+                  "bbox": ",".join(map(str, BBOX)),
+                  "datetime": f"{start}/{end}",
+                  "limit": "100",
+              }
+              response = session.get(SEARCH, params=params, timeout=120)
+              response.raise_for_status()
+              return [
+                  item for item in response.json().get("features", [])
+                  if visual(item) and item.get("geometry")
+              ]
+
+          def search_day(date_string):
+              return search_range(
+                  f"{date_string}T00:00:00Z",
+                  f"{date_string}T23:59:59Z",
+              )
+
+          def search_month(year, month):
+              last_day = calendar.monthrange(year, month)[1]
+              return search_range(
+                  f"{year:04d}-{month:02d}-01T00:00:00Z",
+                  f"{year:04d}-{month:02d}-{last_day:02d}T23:59:59Z",
+              )
+
+          def date_key(item):
+              return item_datetime(item)[:10]
+
+          def intersection_area(item):
+              try:
+                  return shape(item["geometry"]).intersection(AOI).area
+              except Exception:
+                  return 0.0
+
+          def evaluate_date(items):
+              geometries = []
+              weighted_cloud = 0.0
+              total_weight = 0.0
+
+              for item in items:
+                  try:
+                      geom = shape(item["geometry"]).intersection(AOI)
+                  except Exception:
+                      continue
+
+                  if geom.is_empty:
+                      continue
+
+                  geometries.append(geom)
+                  weight = geom.area
+                  weighted_cloud += cloud(item) * weight
+                  total_weight += weight
+
+              if not geometries:
+                  return 0.0, 999.0
+
+              union = unary_union(geometries)
+              coverage = union.area / AOI.area
+              cloud_score = (
+                  weighted_cloud / total_weight
+                  if total_weight > 0
+                  else 999.0
+              )
+              return coverage, cloud_score
+
+          def choose_best_day(items):
+              grouped = {}
+              for item in items:
+                  grouped.setdefault(date_key(item), []).append(item)
+
+              candidates = []
+              for day, day_items in grouped.items():
+                  coverage, cloud_score = evaluate_date(day_items)
+                  candidates.append({
+                      "date": day,
+                      "items": day_items,
+                      "coverage": coverage,
+                      "cloud": cloud_score,
+                  })
+
+              # Only accept days whose combined granules cover the full AOI.
+              full = [
+                  candidate for candidate in candidates
+                  if candidate["coverage"] >= 0.999
+              ]
+
+              if not full:
+                  summary = ", ".join(
+                      f"{c['date']}={c['coverage']:.3%}"
+                      for c in sorted(
+                          candidates,
+                          key=lambda c: c["coverage"],
+                          reverse=True,
+                      )[:8]
+                  )
+                  raise RuntimeError(
+                      "No same-day granule set fully covered the Gaza BBOX. "
+                      f"Best candidates: {summary or 'none'}"
+                  )
+
+              # Least cloud first; newest date breaks exact ties.
+              full.sort(
+                  key=lambda candidate: (
+                      candidate["cloud"],
+                      -datetime.fromisoformat(
+                          candidate["date"]
+                      ).timestamp(),
+                  )
+              )
+              return full[0]
+
+          def lon_to_x(lon, zoom):
+              return int((lon + 180.0) / 360.0 * (1 << zoom))
+
+          def lat_to_y(lat, zoom):
+              radians = math.radians(lat)
+              return int(
+                  (1.0 - math.asinh(math.tan(radians)) / math.pi)
+                  / 2.0
+                  * (1 << zoom)
+              )
+
+          def tile_coordinates():
+              west, south, east, north = BBOX
+              for zoom in ZOOMS:
+                  x0 = lon_to_x(west, zoom)
+                  x1 = lon_to_x(east, zoom)
+                  y0 = lat_to_y(north, zoom)
+                  y1 = lat_to_y(south, zoom)
+
+                  for x in range(x0, x1 + 1):
+                      for y in range(y0, y1 + 1):
+                          yield zoom, x, y
+
+          TILE_COORDINATES = list(tile_coordinates())
+
+          def image_data(image):
+              array = getattr(image, "array", None)
+              if array is None:
+                  array = getattr(image, "data", None)
+              if array is None:
+                  raise RuntimeError("rio-tiler returned no image array")
+
+              array = np.asarray(array)
+              if array.ndim == 2:
+                  array = array[np.newaxis, :, :]
+
+              if array.shape[0] == 1:
+                  array = np.repeat(array, 3, axis=0)
+              elif array.shape[0] > 3:
+                  array = array[:3]
+
+              mask = getattr(image, "mask", None)
+              if mask is None:
+                  if np.ma.isMaskedArray(array):
+                      mask = ~np.any(np.ma.getmaskarray(array), axis=0)
+                  else:
+                      mask = np.ones(array.shape[1:], dtype=bool)
+              else:
+                  mask = np.asarray(mask)
+                  if mask.ndim == 3:
+                      mask = mask[0]
+                  mask = mask > 0
+
+              array = np.ma.getdata(array)
+              array = np.clip(array, 0, 255).astype(np.uint8)
+              return array, mask
+
+          def render_mosaic_tile(readers, x, y, zoom):
+              output = np.zeros((3, 256, 256), dtype=np.uint8)
+              valid = np.zeros((256, 256), dtype=bool)
+
+              for reader in readers:
+                  try:
+                      image = reader.tile(x, y, zoom, tilesize=256)
+                  except Exception:
+                      continue
+
+                  source, source_valid = image_data(image)
+                  take = source_valid & ~valid
+
+                  if not np.any(take):
+                      continue
+
+                  output[:, take] = source[:, take]
+                  valid[take] = True
+
+                  if np.all(valid):
+                      break
+
+              rgba = np.zeros((256, 256, 4), dtype=np.uint8)
+              rgba[:, :, :3] = np.moveaxis(output, 0, 2)
+              rgba[:, :, 3] = valid.astype(np.uint8) * 255
+              return rgba, valid
+
+          def render_folder(label, selected, force):
+              source_ids = sorted(item["id"] for item in selected["items"])
+              source_urls = [visual(item) for item in selected["items"]]
+
+              destination = OUT / label
+              temporary = BUILD / label
+
+              if temporary.exists():
+                  shutil.rmtree(temporary)
+              temporary.mkdir(parents=True, exist_ok=True)
+
+              readers = []
+              missing_tiles = []
+
+              try:
+                  readers = [COGReader(url) for url in source_urls]
+
+                  for number, (zoom, x, y) in enumerate(
+                      TILE_COORDINATES,
+                      start=1,
+                  ):
+                      rgba, valid = render_mosaic_tile(
+                          readers,
+                          x,
+                          y,
+                          zoom,
+                      )
+
+                      # A tile may extend outside the requested BBOX, so
+                      # transparent pixels near the outer edge are allowed.
+                      # A completely empty tile is not allowed.
+                      if not np.any(valid):
+                          missing_tiles.append(f"{zoom}/{x}/{y}")
+                          continue
+
+                      path = (
+                          temporary
+                          / str(zoom)
+                          / str(x)
+                          / f"{y}.webp"
+                      )
+                      path.parent.mkdir(parents=True, exist_ok=True)
+
+                      Image.fromarray(rgba, mode="RGBA").save(
+                          path,
+                          format="WEBP",
+                          quality=80,
+                          method=4,
+                      )
+
+                      if number % 100 == 0:
+                          print(
+                              label,
+                              number,
+                              len(TILE_COORDINATES),
+                          )
+
+              finally:
+                  for reader in readers:
+                      reader.close()
+
+              if missing_tiles:
+                  shutil.rmtree(temporary, ignore_errors=True)
+                  raise RuntimeError(
+                      f"{label}: {len(missing_tiles)} required map tiles "
+                      "had no data after mosaicking. First missing tiles: "
+                      + ", ".join(missing_tiles[:10])
+                  )
+
+              if destination.exists():
+                  shutil.rmtree(destination)
+
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              temporary.rename(destination)
+
+              return {
+                  "date": selected["date"],
+                  "coverage": selected["coverage"],
+                  "cloud": selected["cloud"],
+                  "source_ids": source_ids,
+                  "source_urls": source_urls,
+              }
+
+          def month_keys():
+              now = datetime.now(timezone.utc)
+              year, month = 2023, 10
+
+              while (year, month) <= (now.year, now.month):
+                  yield f"{year:04d}-{month:02d}", year, month
+                  month += 1
+
+                  if month == 13:
+                      year += 1
+                      month = 1
+
+          def load_old_manifest():
+              if not MANIFEST_PATH.exists():
+                  return {}
+
+              try:
+                  return json.loads(
+                      MANIFEST_PATH.read_text(encoding="utf-8")
+                  )
+              except Exception:
+                  return {}
+
+          def same_sources(previous, selected):
+              return (
+                  previous.get("source_ids")
+                  == sorted(item["id"] for item in selected["items"])
+                  and previous.get("bbox") == list(BBOX)
+                  and previous.get("zooms")
+                  == [min(ZOOMS), max(ZOOMS)]
+                  and previous.get("generator_version")
+                  == GENERATOR_VERSION
+              )
+
+          def main():
+              OUT.mkdir(exist_ok=True)
+              BUILD.mkdir(parents=True, exist_ok=True)
+
+              old_manifest = load_old_manifest()
+
+              before_selected = choose_best_day(
+                  search_day(BEFORE_DATE)
+              )
+
+              before_previous = old_manifest.get("before", {})
+              before_force = not same_sources(
+                  before_previous,
+                  before_selected,
+              )
+
+              if before_force or not (OUT / "before").exists():
+                  before_result = render_folder(
+                      "before",
+                      before_selected,
+                      force=True,
+                  )
+              else:
+                  before_result = before_previous
+
+              manifest = {
+                  "generated_at": datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+                  "generator_version": GENERATOR_VERSION,
+                  "bbox": list(BBOX),
+                  "zooms": [min(ZOOMS), max(ZOOMS)],
+                  "before": {
+                      **before_result,
+                      "id": before_selected["items"][0]["id"],
+                      "datetime": item_datetime(
+                          before_selected["items"][0]
+                      ),
+                      "bbox": list(BBOX),
+                      "zooms": [min(ZOOMS), max(ZOOMS)],
+                      "generator_version": GENERATOR_VERSION,
+                  },
+                  "months": {},
+              }
+
+              for key, year, month in month_keys():
+                  print("Selecting", key)
+                  selected = choose_best_day(
+                      search_month(year, month)
+                  )
+
+                  previous = old_manifest.get(
+                      "months",
+                      {},
+                  ).get(key, {})
+
+                  force = not same_sources(previous, selected)
+                  destination = OUT / "monthly" / key
+
+                  if force or not destination.exists():
+                      result = render_folder(
+                          f"monthly/{key}",
+                          selected,
+                          force=True,
+                      )
+                  else:
+                      result = previous
+
+                  representative = sorted(
+                      selected["items"],
+                      key=lambda item: item["id"],
+                  )[0]
+
+                  manifest["months"][key] = {
+                      **result,
+                      "id": representative["id"],
+                      "datetime": item_datetime(representative),
+                      "bbox": list(BBOX),
+                      "zooms": [min(ZOOMS), max(ZOOMS)],
+                      "generator_version": GENERATOR_VERSION,
+                  }
+
+                  # Save progress after every successful month.
+                  MANIFEST_PATH.write_text(
+                      json.dumps(manifest, indent=2),
+                      encoding="utf-8",
+                  )
+
+              MANIFEST_PATH.write_text(
+                  json.dumps(manifest, indent=2),
+                  encoding="utf-8",
+              )
+
+              shutil.rmtree(BUILD, ignore_errors=True)
+              print(json.dumps(manifest, indent=2))
+
+          if __name__ == "__main__":
+              main()
           PY
+
           python /tmp/generate_monthly.py
+
       - name: Commit generated timeline
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tiles
           git diff --cached --quiet && exit 0
-          git commit -m "Update monthly satellite timeline"
+          git commit -m "Generate gap-free monthly mosaics"
           git push
