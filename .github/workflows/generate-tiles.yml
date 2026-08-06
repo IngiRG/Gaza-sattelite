@@ -61,7 +61,7 @@ jobs:
           def lonx(lon,z): return int((lon+180)/360*(1<<z))
           def laty(lat,z):
               radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
-          TILE_PADDING=1
+          TILE_PADDING=5
           def coords():
               west,south,east,north=BBOX
               for z in ZOOMS:
