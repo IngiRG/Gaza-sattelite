@@ -27,7 +27,7 @@ jobs:
 
           SEARCH="https://earth-search.aws.element84.com/v1/search"
           ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
-          BBOX=(34.30,31.38,34.53,31.61)
+          BBOX = (34.18, 31.26, 34.64, 31.71)
           ZOOMS=range(8,16)
           OUT=Path("tiles")
           BEFORE_ID="S2A_36RXV_20230927_0_L2A"
