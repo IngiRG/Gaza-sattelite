@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y poppler-utils
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 pdfplumber
 
       - name: Build WHO casualty timeline
         shell: bash
@@ -39,10 +39,11 @@ jobs:
           import tempfile
 
           import requests
+          import pdfplumber
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 14
+          VERSION = 15
 
           ARCHIVES = [
               # Canonical WHO Gaza Emergency Situation Reports archive.
@@ -645,6 +646,384 @@ jobs:
               return all_pairs
 
 
+
+          # -----------------------------------------------------------------
+          # SPATIAL PAGE-1 PARSER
+          # -----------------------------------------------------------------
+
+          def word_number(text):
+              raw = re.sub(r"[,\s]", "", text or "")
+              if not re.fullmatch(r"\d{3,6}", raw):
+                  return None
+              try:
+                  return int(raw)
+              except Exception:
+                  return None
+
+          def spatial_words(pdf_bytes):
+              """
+              pdfplumber preserves x/y coordinates. This lets us associate a
+              number with the WHO card/label it is physically attached to,
+              rather than relying on reading order in a multi-column PDF.
+              """
+              with tempfile.NamedTemporaryFile(
+                  suffix=".pdf",
+                  delete=False,
+              ) as tmp:
+                  tmp.write(pdf_bytes)
+                  tmp_path = tmp.name
+
+              try:
+                  with pdfplumber.open(tmp_path) as pdf:
+                      if not pdf.pages:
+                          return []
+                      page = pdf.pages[0]
+                      words = page.extract_words(
+                          x_tolerance=2,
+                          y_tolerance=3,
+                          keep_blank_chars=False,
+                          use_text_flow=False,
+                      )
+                      return words or []
+              finally:
+                  try:
+                      Path(tmp_path).unlink()
+                  except Exception:
+                      pass
+
+          def line_groups(words, tolerance=4):
+              """
+              Convert positioned words into visual lines while retaining the
+              bounding box of each line.
+              """
+              rows = []
+
+              for word in sorted(
+                  words,
+                  key=lambda w: (
+                      float(w.get("top", 0)),
+                      float(w.get("x0", 0)),
+                  ),
+              ):
+                  top = float(word.get("top", 0))
+                  target = None
+
+                  for row in rows[-8:]:
+                      if abs(row["top"] - top) <= tolerance:
+                          target = row
+                          break
+
+                  if target is None:
+                      target = {
+                          "top": top,
+                          "words": [],
+                      }
+                      rows.append(target)
+
+                  target["words"].append(word)
+
+              output = []
+
+              for row in rows:
+                  ws = sorted(
+                      row["words"],
+                      key=lambda w: float(w.get("x0", 0)),
+                  )
+                  text = " ".join(
+                      str(w.get("text", ""))
+                      for w in ws
+                  )
+                  output.append({
+                      "text": clean(text),
+                      "top": min(float(w.get("top", 0)) for w in ws),
+                      "bottom": max(float(w.get("bottom", 0)) for w in ws),
+                      "x0": min(float(w.get("x0", 0)) for w in ws),
+                      "x1": max(float(w.get("x1", 0)) for w in ws),
+                      "words": ws,
+                  })
+
+              return output
+
+          def numeric_words(words):
+              out = []
+
+              for word in words:
+                  value = word_number(
+                      str(word.get("text", ""))
+                  )
+                  if value is None:
+                      continue
+
+                  out.append({
+                      "value": value,
+                      "x0": float(word.get("x0", 0)),
+                      "x1": float(word.get("x1", 0)),
+                      "top": float(word.get("top", 0)),
+                      "bottom": float(word.get("bottom", 0)),
+                  })
+
+              return out
+
+          def center_x(item):
+              return (
+                  float(item["x0"])
+                  + float(item["x1"])
+              ) / 2.0
+
+          def nearest_card_number(
+              label,
+              numbers,
+              minimum,
+              maximum,
+          ):
+              """
+              WHO cards generally put the value immediately above/below the
+              label and within the same column. Rank by vertical proximity
+              with a heavy penalty for horizontal misalignment.
+              """
+              lx = center_x(label)
+              candidates = []
+
+              for num in numbers:
+                  value = num["value"]
+
+                  if not (
+                      minimum <= value <= maximum
+                  ):
+                      continue
+
+                  nx = center_x(num)
+                  dx = abs(nx - lx)
+
+                  # Same card / column.
+                  if dx > 125:
+                      continue
+
+                  if num["bottom"] <= label["top"]:
+                      dy = label["top"] - num["bottom"]
+                  elif num["top"] >= label["bottom"]:
+                      dy = num["top"] - label["bottom"]
+                  else:
+                      dy = 0
+
+                  if dy > 125:
+                      continue
+
+                  score = dy + dx * 0.55
+                  candidates.append(
+                      (score, value)
+                  )
+
+              if not candidates:
+                  return None
+
+              candidates.sort(
+                  key=lambda item: item[0]
+              )
+
+              # If two differently-valued numbers are virtually equally close,
+              # don't guess.
+              if (
+                  len(candidates) > 1
+                  and candidates[1][0] - candidates[0][0] < 5
+                  and candidates[1][1] != candidates[0][1]
+              ):
+                  return None
+
+              return candidates[0][1]
+
+          def find_label_lines(lines, regex):
+              return [
+                  line
+                  for line in lines
+                  if re.search(
+                      regex,
+                      line["text"],
+                      re.I,
+                  )
+              ]
+
+          def spatial_early_labels(words, lines):
+              killed_labels = find_label_lines(
+                  lines,
+                  r"(?:people|Palestinians?)\s+"
+                  r"killed\s+in\s+Gaza",
+              )
+              injured_labels = find_label_lines(
+                  lines,
+                  r"(?:people|Palestinians?)\s+"
+                  r"injured\s+in\s+Gaza",
+              )
+
+              nums = numeric_words(words)
+              pairs = []
+
+              for kl in killed_labels:
+                  killed = nearest_card_number(
+                      kl,
+                      nums,
+                      100,
+                      500000,
+                  )
+                  if killed is None:
+                      continue
+
+                  for il in injured_labels:
+                      injured = nearest_card_number(
+                          il,
+                          nums,
+                          100,
+                          1000000,
+                      )
+                      if (
+                          injured is not None
+                          and valid(killed, injured)
+                      ):
+                          pairs.append(
+                              (
+                                  killed,
+                                  injured,
+                                  "spatial-early-gaza-labels",
+                              )
+                          )
+
+              return pairs
+
+          def spatial_overview_cards(words, lines):
+              """
+              Locate the WHO Gaza overview region first, then the Fatalities and
+              Injuries cards inside it. This prevents health-attack/subgroup
+              figures elsewhere on page 1 from being considered.
+              """
+              gaza_lines = find_label_lines(
+                  lines,
+                  r"\bGaza\s+Strip\b",
+              )
+
+              source_lines = find_label_lines(
+                  lines,
+                  r"Source:?\s+Ministry\s+of\s+Health",
+              )
+
+              if not gaza_lines or not source_lines:
+                  return []
+
+              # Choose source line closest below a Gaza Strip heading.
+              regions = []
+
+              for gaza in gaza_lines:
+                  for source in source_lines:
+                      delta = source["top"] - gaza["top"]
+                      if 0 <= delta <= 260:
+                          regions.append(
+                              (delta, gaza, source)
+                          )
+
+              if not regions:
+                  return []
+
+              regions.sort(
+                  key=lambda item: item[0]
+              )
+              _, gaza, source = regions[0]
+
+              top_min = max(
+                  0,
+                  gaza["top"] - 30,
+              )
+              top_max = source["top"] + 260
+
+              scoped_lines = [
+                  line
+                  for line in lines
+                  if top_min <= line["top"] <= top_max
+              ]
+
+              fatalities = find_label_lines(
+                  scoped_lines,
+                  r"\b(?:Reported\s+)?Fatalit(?:y|ies)\b",
+              )
+              injuries = find_label_lines(
+                  scoped_lines,
+                  r"\b(?:Reported\s+)?Injur(?:y|ies)\b",
+              )
+
+              nums = [
+                  num
+                  for num in numeric_words(words)
+                  if (
+                      top_min - 40
+                      <= num["top"]
+                      <= top_max + 40
+                  )
+              ]
+
+              pairs = []
+
+              for fl in fatalities:
+                  killed = nearest_card_number(
+                      fl,
+                      nums,
+                      100,
+                      500000,
+                  )
+
+                  if killed is None:
+                      continue
+
+                  for il in injuries:
+                      injured = nearest_card_number(
+                          il,
+                          nums,
+                          100,
+                          1000000,
+                      )
+
+                      if (
+                          injured is not None
+                          and valid(killed, injured)
+                      ):
+                          pairs.append(
+                              (
+                                  killed,
+                                  injured,
+                                  "spatial-gaza-overview",
+                              )
+                          )
+
+              return pairs
+
+          def spatial_parse(pdf_bytes):
+              words = spatial_words(pdf_bytes)
+
+              if not words:
+                  return {}
+
+              lines = line_groups(words)
+
+              candidates = []
+              candidates.extend(
+                  spatial_early_labels(
+                      words,
+                      lines,
+                  )
+              )
+              candidates.extend(
+                  spatial_overview_cards(
+                      words,
+                      lines,
+                  )
+              )
+
+              output = {}
+
+              for killed, injured, method in candidates:
+                  output.setdefault(
+                      (killed, injured),
+                      set(),
+                  ).add(method)
+
+              return output
           def parse_issue(meta):
               try:
                   if meta["issue"] in DIRECT_ISSUE_URLS:
@@ -726,9 +1105,26 @@ jobs:
                       (mode, content)
                   )
 
-              all_pairs = parse_known_layouts(
+              # Primary method: use the actual visual coordinates from the
+              # PDF so card values stay attached to their labels.
+              all_pairs = spatial_parse(
+                  pdf_bytes
+              )
+
+              # Strict text-layout parser is fallback only.
+              text_pairs = parse_known_layouts(
                   usable_texts
               )
+
+              if not all_pairs:
+                  all_pairs = text_pairs
+              else:
+                  # Agreement from text extraction strengthens the same pair.
+                  for pair, methods in text_pairs.items():
+                      if pair in all_pairs:
+                          all_pairs[pair].update(
+                              methods
+                          )
 
               if not all_pairs:
                   print(
@@ -842,7 +1238,7 @@ jobs:
               )
 
               # Safety gate: never overwrite the timeline with a sparse parse.
-              if len(rows) < 30:
+              if len(rows) < 35:
                   missing = sorted(
                       set(meta["issue"] for meta in metas)
                       - set(row["issue"] for row in rows)
@@ -880,13 +1276,12 @@ jobs:
                   ),
                   "method": (
                       "Issue number and date come from WHO's official report "
-                      "archive. Page 1 is parsed in both layout and raw text "
-                      "modes. A report is accepted only if it matches one of "
-                      "three known WHO structures: explicit Gaza killed/injured "
-                      "labels; the Gaza Strip Overview block marked 'Source: "
-                      "Ministry of Health' with Fatalities/Injuries; or an "
-                      "explicit cumulative-since-October-2023 sentence. No OCR, "
-                      "interpolation, nearest-number matching, or inferred totals."
+                      "archive. The primary parser uses PDF word coordinates "
+                      "to associate the number physically attached to WHO's "
+                      "Gaza-specific Fatalities/Injuries cards or explicit "
+                      "killed/injured-in-Gaza labels. Raw/layout text parsing "
+                      "is used only as a strict fallback. No OCR, interpolation, "
+                      "or inferred totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
