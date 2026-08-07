@@ -45,7 +45,7 @@ jobs:
           BASE = "https://www.ochaopt.org"
           LISTING = BASE + "/page/publications/snapshots"
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 2
+          VERSION = 3
 
           session = requests.Session()
           session.headers.update({
@@ -100,12 +100,26 @@ jobs:
               return None
 
           def title_date(title):
+              # Modern snapshot pages include the effective date directly
+              # in their title. That is authoritative for our timeline and
+              # avoids accidentally picking historical dates mentioned inside
+              # the PDF body.
               match = NEW_TITLE.search(title)
-              return (
-                  parse_date(match.group(1))
-                  if match
-                  else None
-              )
+              if match:
+                  return parse_date(match.group(1))
+
+              # Early OCHA products were labelled "Day N".
+              # Day 1 corresponds to 7 October 2023.
+              early = EARLY_TITLE.search(title)
+              if early:
+                  from datetime import date, timedelta
+                  day_number = int(early.group(1))
+                  return (
+                      date(2023, 10, 7)
+                      + timedelta(days=day_number - 1)
+                  ).isoformat()
+
+              return None
 
           def discover():
               found = {}
@@ -113,7 +127,7 @@ jobs:
 
               # The snapshot archive contains the entire reported-impact
               # series, including October 2023 and current Gaza snapshots.
-              for page in range(0, 80):
+              for page in range(0, 60):
                   url = (
                       LISTING
                       if page == 0
@@ -278,10 +292,20 @@ jobs:
                   )
 
           def effective_date(text, fallback_title):
+              # Always prefer the snapshot page title. OCHA PDFs often mention
+              # other dates (anniversaries, comparison dates, prior reporting
+              # periods), which caused unrelated snapshots to collapse onto
+              # the same timeline date.
+              date = title_date(fallback_title)
+              if date:
+                  return date
+
+              # Only use body text as a fallback for a page whose title does
+              # not expose a date/day number.
               patterns = [
-                  rf"(?:Cumulative\)?\s+)?as of\s+"
-                  rf"(\d{{1,2}}\s+(?:{DATE_WORDS})\s+20\d{{2}})",
                   rf"REPORTED CASUALTIES.*?as of\s+"
+                  rf"(\d{{1,2}}\s+(?:{DATE_WORDS})\s+20\d{{2}})",
+                  rf"\bas of\s+"
                   rf"(\d{{1,2}}\s+(?:{DATE_WORDS})\s+20\d{{2}})",
               ]
 
@@ -293,33 +317,11 @@ jobs:
                   )
 
                   if match:
-                      date = parse_date(
-                          match.group(1)
-                      )
+                      parsed = parse_date(match.group(1))
+                      if parsed:
+                          return parsed
 
-                      if date:
-                          return date
-
-              date = title_date(
-                  fallback_title
-              )
-
-              if date:
-                  return date
-
-              # Early pages usually expose their publication date near the
-              # title even when the casualty graphic is embedded.
-              match = re.search(
-                  rf"\b(\d{{1,2}}\s+(?:{DATE_WORDS})\s+20\d{{2}})\b",
-                  text,
-                  re.I,
-              )
-
-              return (
-                  parse_date(match.group(1))
-                  if match
-                  else None
-              )
+              return None
 
           def casualty_section(text):
               upper = text.upper()
@@ -538,6 +540,13 @@ jobs:
 
               # The requested public timeline starts 8 October 2023.
               if date < "2023-10-08":
+                  return None
+
+              # Reject impossible future dates rather than publishing a bad
+              # parse. Allow today's date, because a snapshot can be released
+              # the same day the workflow runs.
+              today = datetime.now(timezone.utc).date().isoformat()
+              if date > today:
                   return None
 
               killed, injured = metrics
