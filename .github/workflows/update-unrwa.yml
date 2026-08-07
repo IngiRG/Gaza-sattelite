@@ -1,0 +1,792 @@
+name: Update UNRWA timeline from UNISPAL
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install updater
+        run: pip install requests
+
+      - name: Fetch UNRWA reports from UNISPAL
+        shell: bash
+        run: |
+          cat > /tmp/update_unispal.py <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from urllib.parse import quote
+          import json
+          import re
+          import time
+          import requests
+
+          OUT = Path("data/unrwa-reports.json")
+          VERSION = 4
+
+          # Official UN mirror / repository.
+          CATEGORY = "https://www.un.org/unispal/document-category/situation-report/"
+          SITE = "https://www.un.org/unispal/"
+
+          # UN pages sometimes reject data-centre requests. Jina Reader is only
+          # used as a read-only transport for the public UNISPAL pages.
+          READER = "https://r.jina.ai/"
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "DestructionVisualized/4.0",
+              "Accept": "text/plain,text/markdown,*/*",
+          })
+
+          REPORT_TITLE = re.compile(
+              r"UNRWA\s+Situation\s+Report\s+#\s*(\d+)",
+              re.I,
+          )
+
+          UNISPAL_URL = re.compile(
+              r"https?://(?:www\.)?un\.org/unispal/document/"
+              r"[^\s\)\]<>\"']+",
+              re.I,
+          )
+
+          MARKDOWN_LINK = re.compile(
+              r"\[([^\]]*UNRWA[^\]]*Situation Report[^\]]*)\]"
+              r"\((https?://(?:www\.)?un\.org/unispal/document/[^\)]+)\)",
+              re.I,
+          )
+
+          def clean(value):
+              return re.sub(r"\s+", " ", value or "").strip()
+
+          def canonical(url):
+              return (
+                  url.split("#", 1)[0]
+                  .split("?", 1)[0]
+                  .rstrip(".,;:")
+              )
+
+          def get_reader(url, timeout=120):
+              response = session.get(
+                  READER + url,
+                  timeout=timeout,
+              )
+              response.raise_for_status()
+              return response.text
+
+          def get_direct(url, timeout=90):
+              response = session.get(
+                  url,
+                  timeout=timeout,
+              )
+              response.raise_for_status()
+              return response.text
+
+          def read_public_page(url):
+              # Prefer the UN site directly. Fall back to Jina Reader if the
+              # GitHub-hosted runner receives a 403 or other access error.
+              try:
+                  return get_direct(url)
+              except Exception as direct_error:
+                  print(
+                      f"Direct fetch failed for {url}: "
+                      f"{direct_error}; trying reader."
+                  )
+                  return get_reader(url)
+
+          def is_gaza_report_title(title):
+              low = title.lower()
+              return (
+                  "unrwa situation report" in low
+                  and (
+                      "gaza" in low
+                      or "humanitarian crisis" in low
+                  )
+              )
+
+          def extract_report_links(text):
+              found = {}
+
+              # Markdown links produced by the reader preserve titles nicely.
+              for title, url in MARKDOWN_LINK.findall(text):
+                  title = clean(title)
+                  if not is_gaza_report_title(title):
+                      continue
+
+                  match = REPORT_TITLE.search(title)
+                  if match:
+                      found[int(match.group(1))] = canonical(url)
+
+              # Fallback: find report headings and pair them with a nearby URL.
+              for match in REPORT_TITLE.finditer(text):
+                  number = int(match.group(1))
+                  block = text[
+                      max(0, match.start() - 250):
+                      match.start() + 1800
+                  ]
+
+                  if "gaza" not in block.lower():
+                      continue
+
+                  urls = UNISPAL_URL.findall(block)
+                  if urls:
+                      found.setdefault(
+                          number,
+                          canonical(urls[0]),
+                      )
+
+              return found
+
+          def archive_urls():
+              # Search & Filter / WordPress installations can expose pagination
+              # in more than one form. Try several harmless public variants.
+              yield CATEGORY
+
+              for page in range(2, 90):
+                  yield f"{CATEGORY}page/{page}/"
+                  yield f"{CATEGORY}?sf_paged={page}"
+
+          def discover_from_archive():
+              found = {}
+              failures = 0
+              successful_pages = 0
+
+              for url in archive_urls():
+                  page_label = url.replace(CATEGORY, "") or "page 1"
+                  print("Reading UNISPAL archive:", page_label)
+
+                  try:
+                      text = read_public_page(url)
+                  except Exception as error:
+                      print("Archive page failed:", error)
+                      failures += 1
+
+                      if successful_pages and failures >= 10:
+                          break
+                      continue
+
+                  page_found = extract_report_links(text)
+
+                  if not page_found:
+                      failures += 1
+
+                      # Once we have already collected reports, repeated empty
+                      # pages usually mean we have reached the end.
+                      if successful_pages and failures >= 10:
+                          break
+                      continue
+
+                  failures = 0
+                  successful_pages += 1
+                  before = len(found)
+                  found.update(page_found)
+
+                  print(
+                      f"Archive yielded {len(page_found)} report links; "
+                      f"{len(found)} unique total."
+                  )
+
+                  if 1 in found:
+                      print("Situation Report #1 found.")
+                      break
+
+                  # If this pagination spelling is returning the same content
+                  # repeatedly, don't waste runner time forever.
+                  if len(found) == before and successful_pages > 20:
+                      break
+
+                  time.sleep(0.15)
+
+              return found
+
+          def discover_single(number):
+              # Fallback for archive gaps. This uses UNISPAL's own public
+              # WordPress search page, not an external search API.
+              queries = [
+                  f"{SITE}?s={quote(f'UNRWA Situation Report #{number}')}",
+                  f"{SITE}?s={quote(f'UNRWA Situation Report {number} Gaza')}",
+              ]
+
+              for url in queries:
+                  try:
+                      text = read_public_page(url)
+                  except Exception:
+                      continue
+
+                  candidates = extract_report_links(text)
+
+                  if number in candidates:
+                      return candidates[number]
+
+                  # If titles were transformed, inspect all nearby links.
+                  for report_no, report_url in candidates.items():
+                      if report_no == number:
+                          return report_url
+
+              return None
+
+          def report_date(text):
+              # Prefer explicit UNISPAL publication metadata.
+              patterns = [
+                  (
+                      r"Publication Date:\s*"
+                      r"(\d{1,2})/(\d{1,2})/(20\d{2})",
+                      "dmy-slash",
+                  ),
+                  (
+                      r"\b(\d{1,2})\s+"
+                      r"(January|February|March|April|May|June|July|"
+                      r"August|September|October|November|December)"
+                      r"\s+(20\d{2})\b",
+                      "dmy-word",
+                  ),
+                  (
+                      r"\b"
+                      r"(January|February|March|April|May|June|July|"
+                      r"August|September|October|November|December)"
+                      r"\s+(\d{1,2}),\s+(20\d{2})\b",
+                      "mdy-word",
+                  ),
+              ]
+
+              for pattern, kind in patterns:
+                  match = re.search(pattern, text, re.I)
+                  if not match:
+                      continue
+
+                  try:
+                      if kind == "dmy-slash":
+                          day, month, year = map(
+                              int,
+                              match.groups(),
+                          )
+                          return datetime(
+                              year,
+                              month,
+                              day,
+                          ).date().isoformat()
+
+                      if kind == "dmy-word":
+                          raw = (
+                              f"{match.group(1)} "
+                              f"{match.group(2)} "
+                              f"{match.group(3)}"
+                          )
+                          return datetime.strptime(
+                              raw,
+                              "%d %B %Y",
+                          ).date().isoformat()
+
+                      raw = (
+                          f"{match.group(1)} "
+                          f"{match.group(2)} "
+                          f"{match.group(3)}"
+                      )
+                      return datetime.strptime(
+                          raw,
+                          "%B %d %Y",
+                      ).date().isoformat()
+
+                  except Exception:
+                      pass
+
+              return None
+
+          def reporting_period(text):
+              patterns = [
+                  r"All information updated for\s+([^\n]{3,120})",
+                  r"All information updated as of\s+([^\n]{3,120})",
+                  r"All information valid as of\s+([^\n]{3,120})",
+                  r"Information covers the period\s+([^\n]{3,120})",
+              ]
+
+              for pattern in patterns:
+                  match = re.search(pattern, text, re.I)
+                  if match:
+                      return clean(match.group(1))
+
+              return None
+
+          def chunks(text):
+              return [
+                  clean(part)
+                  for part in re.split(
+                      r"(?<=[.!?])\s+|\n+",
+                      text.replace("\r", "\n"),
+                  )
+                  if 15 <= len(clean(part)) <= 1600
+              ]
+
+          def casualty(sentences, word):
+              candidates = []
+
+              patterns = [
+                  rf"(\d[\d,]*)\s+"
+                  rf"(?:Palestinians|people|persons|individuals|"
+                  rf"civilians)?\s*"
+                  rf"(?:have been|were|are|reportedly|reported)?\s*"
+                  rf"{word}\b",
+                  rf"\b{word}\b[^\d]{{0,55}}(\d[\d,]*)",
+              ]
+
+              for sentence in sentences:
+                  low = sentence.lower()
+
+                  if word not in low:
+                      continue
+
+                  # Avoid subgroup / incident counts when looking for the
+                  # cumulative Gaza-wide headline figure.
+                  if any(
+                      phrase in low
+                      for phrase in (
+                          "unrwa staff",
+                          "unrwa colleague",
+                          "staff members",
+                          "installation",
+                          "facility",
+                          "school was",
+                          "school were",
+                      )
+                  ):
+                      continue
+
+                  if not any(
+                      phrase in low
+                      for phrase in (
+                          "gaza",
+                          "palestinian",
+                          "ministry of health",
+                          "moh",
+                          "ocha",
+                      )
+                  ):
+                      continue
+
+                  for pattern in patterns:
+                      for match in re.finditer(
+                          pattern,
+                          sentence,
+                          re.I,
+                      ):
+                          value = int(
+                              match.group(1).replace(",", "")
+                          )
+
+                          if value >= 100:
+                              candidates.append(
+                                  (value, sentence)
+                              )
+
+              if not candidates:
+                  return None, None
+
+              candidates.sort(
+                  key=lambda item: item[0],
+                  reverse=True,
+              )
+
+              return candidates[0]
+
+          def casualty_source(sentence):
+              if not sentence:
+                  return None
+
+              low = sentence.lower()
+
+              if (
+                  "ministry of health" in low
+                  or "moh" in low
+              ):
+                  return (
+                      "Gaza Ministry of Health, "
+                      "as cited in the UNRWA report"
+                  )
+
+              if "ocha" in low:
+                  return (
+                      "OCHA, as cited in the UNRWA report"
+                  )
+
+              return "UNRWA Situation Report via UNISPAL"
+
+          def staff_killed(sentences):
+              values = []
+
+              for sentence in sentences:
+                  low = sentence.lower()
+
+                  if (
+                      "unrwa" not in low
+                      or "staff" not in low
+                      or "killed" not in low
+                  ):
+                      continue
+
+                  for pattern in [
+                      r"(\d[\d,]*)\s+(?:UNRWA\s+)?"
+                      r"staff(?: members)?(?: have been| were)? killed",
+                      r"(?:death toll among UNRWA staff|"
+                      r"UNRWA staff killed)[^\d]{0,60}(\d[\d,]*)",
+                  ]:
+                      match = re.search(
+                          pattern,
+                          sentence,
+                          re.I,
+                      )
+
+                      if match:
+                          values.append(
+                              int(
+                                  match.group(1).replace(",", "")
+                              )
+                          )
+
+              return max(values) if values else None
+
+          def sheltering(sentences):
+              candidates = []
+
+              for sentence in sentences:
+                  low = sentence.lower()
+
+                  if "shelter" not in low:
+                      continue
+
+                  if not any(
+                      term in low
+                      for term in (
+                          "unrwa",
+                          "displaced",
+                          "idp",
+                      )
+                  ):
+                      continue
+
+                  values = [
+                      int(value.replace(",", ""))
+                      for value in re.findall(
+                          r"\b\d[\d,]{2,}\b",
+                          sentence,
+                      )
+                  ]
+
+                  if values:
+                      candidates.append(
+                          max(values)
+                      )
+
+              if not candidates:
+                  return None
+
+              value = max(candidates)
+
+              return (
+                  f"{value:,} people "
+                  "(sheltering/displacement figure cited in report)"
+              )
+
+          def installations(sentences):
+              values = []
+
+              for sentence in sentences:
+                  low = sentence.lower()
+
+                  if "unrwa" not in low:
+                      continue
+
+                  if not (
+                      "installation" in low
+                      or "facilit" in low
+                  ):
+                      continue
+
+                  if not any(
+                      term in low
+                      for term in (
+                          "damage",
+                          "damaged",
+                          "impact",
+                          "impacted",
+                          "hit",
+                      )
+                  ):
+                      continue
+
+                  for match in re.finditer(
+                      r"(\d[\d,]*)\s+(?:UNRWA\s+)?"
+                      r"(?:installations|facilities)",
+                      sentence,
+                      re.I,
+                  ):
+                      values.append(
+                          int(
+                              match.group(1).replace(",", "")
+                          )
+                      )
+
+              return max(values) if values else None
+
+          def original_unrwa_url(text):
+              match = re.search(
+                  r"URL source:\s*"
+                  r"(https?://(?:www\.)?unrwa\.org/[^\s<>\]]+)",
+                  text,
+                  re.I,
+              )
+
+              if match:
+                  return canonical(match.group(1))
+
+              return None
+
+          def parse_report(number, unispal_url):
+              text = read_public_page(unispal_url)
+              sentences = chunks(text)
+
+              killed, killed_sentence = casualty(
+                  sentences,
+                  "killed",
+              )
+              injured, injured_sentence = casualty(
+                  sentences,
+                  "injured",
+              )
+
+              return {
+                  "number": number,
+                  "title": (
+                      f"UNRWA Situation Report #{number}"
+                  ),
+                  # The app's source button opens the accessible UN mirror.
+                  "url": unispal_url,
+                  "original_unrwa_url": original_unrwa_url(text),
+                  "date": report_date(text),
+                  "reporting_period": reporting_period(text),
+                  "killed": killed,
+                  "injured": injured,
+                  "casualty_source": casualty_source(
+                      killed_sentence
+                      or injured_sentence
+                  ),
+                  "unrwa_staff_killed": staff_killed(
+                      sentences
+                  ),
+                  "sheltering_text": sheltering(
+                      sentences
+                  ),
+                  "installations_affected": installations(
+                      sentences
+                  ),
+                  "mirror": "UNISPAL",
+                  "scraper_version": VERSION,
+              }
+
+          def load_old():
+              if not OUT.exists():
+                  return {}
+
+              try:
+                  payload = json.loads(
+                      OUT.read_text(encoding="utf-8")
+                  )
+
+                  return {
+                      int(report["number"]): report
+                      for report in payload.get(
+                          "reports",
+                          [],
+                      )
+                      if report.get("number") is not None
+                  }
+
+              except Exception:
+                  return {}
+
+          def main():
+              OUT.parent.mkdir(
+                  parents=True,
+                  exist_ok=True,
+              )
+
+              old = load_old()
+
+              print(
+                  "Discovering UNRWA Situation Reports "
+                  "in the UNISPAL archive..."
+              )
+
+              discovered = discover_from_archive()
+
+              # If archive pagination misses historical reports, search only
+              # the missing report numbers on UNISPAL's own public search.
+              if discovered:
+                  maximum = max(discovered)
+              elif old:
+                  maximum = max(old)
+              else:
+                  maximum = 230
+
+              # Search a small window above the highest known report so a newly
+              # published report can be discovered without depending solely on
+              # the archive page order.
+              search_top = maximum + 5
+
+              for number in range(1, search_top + 1):
+                  if number in discovered:
+                      continue
+                  if number in old and number < maximum - 5:
+                      continue
+
+                  try:
+                      url = discover_single(number)
+                  except Exception as error:
+                      print(
+                          f"UNISPAL search failed for #{number}: "
+                          f"{error}"
+                      )
+                      url = None
+
+                  if url:
+                      discovered[number] = url
+
+                  time.sleep(0.08)
+
+              if not discovered and not old:
+                  raise RuntimeError(
+                      "No UNRWA Situation Reports could be "
+                      "discovered from UNISPAL."
+                  )
+
+              reports = []
+
+              for index, number in enumerate(
+                  sorted(discovered),
+                  start=1,
+              ):
+                  unispal_url = discovered[number]
+                  previous = old.get(number)
+
+                  if (
+                      previous
+                      and previous.get("scraper_version")
+                      == VERSION
+                      and previous.get("url") == unispal_url
+                  ):
+                      reports.append(previous)
+                      continue
+
+                  print(
+                      f"Reading UNISPAL report #{number} "
+                      f"({index}/{len(discovered)})"
+                  )
+
+                  try:
+                      parsed = parse_report(
+                          number,
+                          unispal_url,
+                      )
+
+                      if parsed.get("date"):
+                          reports.append(parsed)
+                      elif previous:
+                          reports.append(previous)
+                      else:
+                          print(
+                              f"Skipping report #{number}: "
+                              "publication date was not parsed."
+                          )
+
+                  except Exception as error:
+                      print(
+                          f"Report #{number} failed: {error}"
+                      )
+
+                      if previous:
+                          reports.append(previous)
+
+                  time.sleep(0.15)
+
+              # Preserve previously successful historical reports even if an
+              # archive page temporarily fails or changes.
+              included = {
+                  int(report["number"])
+                  for report in reports
+              }
+
+              for number, previous in old.items():
+                  if number not in included:
+                      reports.append(previous)
+
+              unique = {
+                  int(report["number"]): report
+                  for report in reports
+              }
+
+              reports = list(unique.values())
+              reports.sort(
+                  key=lambda report: (
+                      report.get("date")
+                      or "9999-12-31",
+                      report["number"],
+                  )
+              )
+
+              if not reports:
+                  raise RuntimeError(
+                      "No UNRWA reports were successfully parsed."
+                  )
+
+              payload = {
+                  "source": (
+                      "UNRWA Situation Reports mirrored by "
+                      "United Nations UNISPAL"
+                  ),
+                  "source_index": CATEGORY,
+                  "updated_at": datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+                  "scraper_version": VERSION,
+                  "reports": reports,
+              }
+
+              OUT.write_text(
+                  json.dumps(
+                      payload,
+                      indent=2,
+                      ensure_ascii=False,
+                  ),
+                  encoding="utf-8",
+              )
+
+              print(
+                  f"Wrote {len(reports)} reports to {OUT}"
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python /tmp/update_unispal.py
+
+      - name: Commit timeline data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/unrwa-reports.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update UNRWA timeline from UNISPAL"
+          git push
