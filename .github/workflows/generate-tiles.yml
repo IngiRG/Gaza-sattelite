@@ -39,6 +39,37 @@ jobs:
           OUT=Path("tiles")
           AOI=box(*BBOX)
 
+          # Build one fixed, tile-aligned extent at the highest zoom.
+          # This becomes the visible map footprint at every zoom level.
+          MAX_ZOOM=max(ZOOMS)
+
+          def tile_x(lon,z):
+              return int((lon+180.0)/360.0*(1<<z))
+
+          def tile_y(lat,z):
+              r=math.radians(lat)
+              return int((1.0-math.asinh(math.tan(r))/math.pi)/2.0*(1<<z))
+
+          def tile_lon(x,z):
+              return x/(1<<z)*360.0-180.0
+
+          def tile_lat(y,z):
+              n=math.pi*(1.0-2.0*y/(1<<z))
+              return math.degrees(math.atan(math.sinh(n)))
+
+          west,south,east,north=BBOX
+          sx0=tile_x(west,MAX_ZOOM)
+          sx1=tile_x(east,MAX_ZOOM)
+          sy0=tile_y(north,MAX_ZOOM)
+          sy1=tile_y(south,MAX_ZOOM)
+
+          DISPLAY_BBOX=(
+              tile_lon(sx0,MAX_ZOOM),
+              tile_lat(sy1+1,MAX_ZOOM),
+              tile_lon(sx1+1,MAX_ZOOM),
+              tile_lat(sy0,MAX_ZOOM),
+          )
+
           def get_item(item_id):
               r=requests.get(f"{ITEM}/{item_id}",timeout=90);r.raise_for_status();return r.json()
           def search_month(year,month):
@@ -93,7 +124,7 @@ jobs:
           def laty(lat,z):
               radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
           def coords():
-              west,south,east,north=BBOX
+              west,south,east,north=DISPLAY_BBOX
               for z in ZOOMS:
                   x0=lonx(west,z)
                   x1=lonx(east,z)
@@ -138,7 +169,7 @@ jobs:
               mercator_y=np.pi*(1.0-2.0*pixel_y/world)
               lat=np.degrees(np.arctan(np.sinh(mercator_y)))
 
-              west,south,east,north=BBOX
+              west,south,east,north=DISPLAY_BBOX
               lon_ok=(lon>=west)&(lon<=east)
               lat_ok=(lat>=south)&(lat<=north)
 
@@ -200,8 +231,8 @@ jobs:
           if manifest_path.exists():
               try:old_manifest=json.loads(manifest_path.read_text())
               except Exception:old_manifest={}
-          before=get_item(BEFORE_ID);render("before",before,None,force=(old_manifest.get("bbox_mode")!="exact" or old_manifest.get("before",{}).get("id")!=before["id"]))
-          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox_mode":"exact","bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
+          before=get_item(BEFORE_ID);render("before",before,None,force=(old_manifest.get("bbox_mode")!="fixed_extent" or old_manifest.get("before",{}).get("id")!=before["id"]))
+          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox_mode":"fixed_extent","bbox":BBOX,"display_bbox":DISPLAY_BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
           for key,year,month in month_keys():
               selected,backup=choose_month(search_month(year,month))
               if selected is None:
@@ -211,7 +242,7 @@ jobs:
                   f"monthly/{key}",
                   selected,
                   backup,
-                  force=(old_manifest.get("bbox_mode")!="exact" or previous.get("id")!=selected["id"])
+                  force=(old_manifest.get("bbox_mode")!="fixed_extent" or previous.get("id")!=selected["id"])
               )
               manifest["months"][key]={
                   "id":selected["id"],
