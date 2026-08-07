@@ -1,0 +1,172 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><meta name="theme-color" content="#0b1017"><title>Gaza Satellite Timeline</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>
+*{box-sizing:border-box}html,body,#stage,.map{width:100%;height:100%;margin:0}body{overflow:hidden;background:#111923;color:#fff;font-family:system-ui,-apple-system,Segoe UI,sans-serif}#stage{position:relative;background:#131c27}.map{position:absolute;inset:0;background:#131c27}#beforeMap{z-index:1}#afterWrap{position:absolute;inset:0;z-index:2;overflow:hidden;pointer-events:none;clip-path:inset(0 0 0 50%);-webkit-clip-path:inset(0 0 0 50%);will-change:clip-path}#afterMap{pointer-events:none}.panel{position:absolute;z-index:1000;top:max(9px,env(safe-area-inset-top));left:9px;right:9px;max-width:940px;margin:auto;padding:11px 12px;border:1px solid rgba(255,255,255,.18);border-radius:15px;background:rgba(9,13,19,.92);backdrop-filter:blur(14px);box-shadow:0 8px 30px rgba(0,0,0,.42)}h1{font-size:clamp(16px,4.4vw,21px);margin:0;font-weight:800}.meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.pill{font-size:11px;padding:5px 8px;border:1px solid rgba(255,255,255,.2);border-radius:999px;background:rgba(255,255,255,.06)}.before{border-color:#d7a93c}.after{border-color:#3ab487}.help{margin-top:7px;font-size:11px;line-height:1.35;color:#cbd4df}.controls{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}button{border:1px solid rgba(255,255,255,.2);background:#182230;color:#fff;border-radius:9px;padding:7px 9px;font-size:11px;font-weight:700}#status{margin-top:6px;min-height:15px;font-size:11px;color:#ffd28a}#divider{position:absolute;z-index:650;top:0;bottom:0;left:50%;width:48px;margin-left:-24px;background:linear-gradient(to right,transparent 22px,#fff 22px,#fff 25px,transparent 25px);filter:drop-shadow(0 0 6px #000);touch-action:none;cursor:ew-resize}#handle{position:absolute;top:54%;left:50%;transform:translate(-50%,-50%);width:50px;height:50px;border-radius:50%;display:grid;place-items:center;background:#fff;color:#111;font-size:22px;font-weight:900;box-shadow:0 4px 18px rgba(0,0,0,.6);touch-action:none;user-select:none;-webkit-user-select:none}.label{position:absolute;z-index:700;top:50%;padding:6px 9px;border:1px solid rgba(255,255,255,.25);border-radius:999px;background:rgba(0,0,0,.7);font-size:11px;font-weight:800;pointer-events:none}#leftLabel{left:9px}#rightLabel{right:9px}.timeline{position:absolute;z-index:950;left:9px;right:9px;bottom:max(9px,env(safe-area-inset-bottom));margin:auto;max-width:940px;padding:10px 12px;border:1px solid rgba(255,255,255,.18);border-radius:14px;background:rgba(9,13,19,.94);backdrop-filter:blur(14px);box-shadow:0 8px 30px rgba(0,0,0,.4)}.timelineHead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:#cbd4df}#monthTitle{font-size:13px;font-weight:800;color:#fff}#monthMeta{font-size:10px;text-align:right}#monthSlider{width:100%;margin-top:8px;accent-color:#fff}.rangeLabels{display:flex;justify-content:space-between;font-size:9px;color:#aeb9c7;margin-top:2px}.note{font-size:9px;color:#bfc9d5;margin-top:5px;line-height:1.25}.leaflet-control-zoom{margin-top:205px!important;margin-bottom:130px!important}@media(max-width:520px){.timeline{padding:9px 10px}.note{font-size:8px}.leaflet-control-zoom{margin-bottom:145px!important}}
+.aboutModal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.65);z-index:3000;padding:20px}.aboutBox{max-width:700px;background:#111923;color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:16px;padding:18px;line-height:1.5}.aboutBox h2{margin:0 0 10px;font-size:20px}.aboutBox button{margin-top:14px}
+.appTabs{position:fixed;z-index:2500;top:max(8px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);
+display:flex;gap:4px;padding:4px;border:1px solid rgba(255,255,255,.18);border-radius:999px;background:rgba(7,11,17,.96);
+box-shadow:0 5px 20px rgba(0,0,0,.35)}
+.appTab{border:0!important;border-radius:999px!important;padding:7px 11px!important;background:transparent!important;color:#bec8d5!important}
+.appTab.active{background:#fff!important;color:#10151d!important}
+#satelliteView{position:absolute;inset:0}
+#satelliteView.hidden{display:none}
+#casualtyView{position:absolute;inset:0;display:none;background:#111923;color:#fff;overflow:hidden;z-index:2200}
+#casualtyView.active{display:block}
+.casTop{position:absolute;z-index:3;top:max(57px,calc(env(safe-area-inset-top) + 48px));left:10px;right:10px;max-width:940px;margin:auto;
+background:rgba(9,13,19,.95);border:1px solid rgba(255,255,255,.18);border-radius:15px;padding:12px;backdrop-filter:blur(14px)}
+.casTitle{font-size:18px;font-weight:800;margin:0 0 8px}
+.casDate{font-size:10px;color:#b8c3cf;margin-bottom:9px}
+.casStats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.casCard{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.13);border-radius:12px;padding:10px}
+.casLabel{font-size:9px;text-transform:uppercase;letter-spacing:.04em;color:#aeb9c7}
+.casValue{font-size:24px;font-weight:850;margin-top:2px}
+.casSub{font-size:9px;color:#aeb9c7;margin-top:2px}
+.casBody{position:absolute;z-index:2;top:250px;bottom:177px;left:10px;right:10px;max-width:940px;margin:auto;overflow:auto;
+background:rgba(9,13,19,.80);border:1px solid rgba(255,255,255,.13);border-radius:14px;padding:12px}
+.metricGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.metric{border-bottom:1px solid rgba(255,255,255,.12);padding:4px 0 9px}
+.metricK{font-size:9px;color:#aeb9c7}.metricV{font-size:17px;font-weight:760;margin-top:2px}
+.casSource{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:13px;padding-top:10px;border-top:1px solid rgba(255,255,255,.12)}
+.casSourceText{font-size:9px;line-height:1.35;color:#aeb9c7}
+.casLink{color:#a9d7ff;text-decoration:none;font-size:10px;border:1px solid rgba(169,215,255,.35);padding:6px 8px;border-radius:8px;white-space:nowrap}
+.casTimeline{position:absolute;z-index:3;left:10px;right:10px;bottom:max(9px,env(safe-area-inset-bottom));max-width:940px;margin:auto;
+background:rgba(9,13,19,.96);border:1px solid rgba(255,255,255,.18);border-radius:14px;padding:10px 12px;backdrop-filter:blur(14px)}
+.casTimelineHead{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:10px}
+#casSelected{font-size:13px;font-weight:800}#casCount{color:#aeb9c7;text-align:right}
+#casSlider{width:100%;margin-top:8px;accent-color:#fff}
+.casRange{display:flex;justify-content:space-between;font-size:9px;color:#aeb9c7}
+.casNote{font-size:8px;line-height:1.3;color:#9daab8;margin-top:7px}
+@media(max-width:520px){
+  .panel{top:max(57px,calc(env(safe-area-inset-top) + 48px))}
+  .casTop{padding:10px}.casValue{font-size:21px}.casBody{top:242px;bottom:188px}
+}
+</style></head><body>
+<nav class="appTabs">
+  <button id="satTab" class="appTab active" type="button">Satellite</button>
+  <button id="casTab" class="appTab" type="button">Casualties</button>
+</nav>
+<section id="satelliteView"><div id="stage"><div id="beforeMap" class="map"></div><div id="afterWrap"><div id="afterMap" class="map"></div></div></div><div id="divider"><div id="handle">↔</div></div><div class="label" id="leftLabel">27 Sept 2023</div><div class="label" id="rightLabel">Monthly scene</div><section class="panel"><h1>Gaza — Sentinel‑2 monthly timeline</h1><div class="meta"><span class="pill before">Before: 27 Sept 2023</span><span class="pill after" id="laterPill">Monthly scene</span></div><div class="help">The right side shows the lowest-cloud Sentinel‑2 scene selected for each month. Drag the vertical handle to compare.</div><div class="controls"><button id="showBefore">Before</button><button id="split">Split</button><button id="showAfter">Selected month</button><button id="aboutBtn">About</button></div><div id="status">Loading timeline manifest…</div></section><section class="timeline"><div class="timelineHead"><div id="monthTitle">Loading months…</div><div id="monthMeta"></div></div><input id="monthSlider" type="range" min="0" max="0" value="0" step="1" disabled><div class="rangeLabels"><span id="firstMonth"></span><span id="lastMonth"></span></div><div class="note">Cloud percentage applies to the full Sentinel‑2 tile, not only Gaza. The current month uses the clearest scene available so far.</div></section><div id="aboutModal" class="aboutModal"><div class="aboutBox"><h2>About this project</h2><p><strong>Data source:</strong> Copernicus Sentinel‑2 Level‑2A imagery processed from Element 84 Earth Search open data.</p><p><strong>Method:</strong> Left map: 27 Sept 2023. Right map: one low‑cloud Sentinel‑2 scene for each month. Tiles are generated by GitHub Actions.</p><p><strong>Independence:</strong> This is an independent visualization project and is not affiliated with ESA, the Copernicus Programme or Element 84.</p><p><strong>Interpretation:</strong> The application displays satellite imagery as recorded and does not make claims about the causes of visible changes.</p><p><strong>Attribution:</strong> © European Union, Copernicus Sentinel‑2.</p><button id="closeAbout">Close</button></div></div></section>
+<section id="casualtyView">
+  <div class="casTop">
+    <h2 class="casTitle">Reported Gaza casualties</h2>
+    <div id="casAsOf" class="casDate">Loading WHO data…</div>
+    <div class="casStats">
+      <div class="casCard">
+        <div class="casLabel">Reported killed</div>
+        <div id="casKilled" class="casValue">—</div>
+        <div class="casSub">cumulative since 7 Oct 2023</div>
+      </div>
+      <div class="casCard">
+        <div class="casLabel">Reported injured</div>
+        <div id="casInjured" class="casValue">—</div>
+        <div class="casSub">cumulative since 7 Oct 2023</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="casBody">
+    <div class="metricGrid">
+      <div class="metric"><div class="metricK">Days since 7 Oct 2023</div><div id="daysSince" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Killed per day since 7 Oct 2023</div><div id="killedPerDay" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Injured per day since 7 Oct 2023</div><div id="injuredPerDay" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Days since previous WHO total</div><div id="daysDelta" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Additional killed since previous WHO total</div><div id="killedDelta" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Additional injured since previous WHO total</div><div id="injuredDelta" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Killed / day since previous WHO total</div><div id="killedDeltaRate" class="metricV">—</div></div>
+      <div class="metric"><div class="metricK">Injured / day since previous WHO total</div><div id="injuredDeltaRate" class="metricV">—</div></div>
+    </div>
+
+    <div class="casSource">
+      <div class="casSourceText">
+        Source: Gaza Ministry of Health figures as cited by WHO. The site only imports a record when OCHA explicitly states the cumulative killed and injured totals since 7 October 2023 in the same passage.
+      </div>
+      <a id="casSourceLink" class="casLink" href="#" target="_blank" rel="noopener">Open WHO report</a>
+    </div>
+  </div>
+
+  <div class="casTimeline">
+    <div class="casTimelineHead">
+      <div id="casSelected">Loading…</div>
+      <div id="casCount"></div>
+    </div>
+    <input id="casSlider" type="range" min="0" max="0" value="0" step="1" disabled>
+    <div class="casRange"><span id="casFirst"></span><span id="casLast"></span></div>
+    <div class="casNote">“Reported” is intentional: these figures are attributed by OCHA to the Gaza Ministry of Health. A WHO report is skipped if its Gaza casualty totals cannot be parsed unambiguously.</div>
+  </div>
+</section>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
+const opts={center:[31.50,34.405],zoom:11,minZoom:8,maxZoom:14,zoomAnimation:false,fadeAnimation:false,attributionControl:true};const beforeMap=L.map('beforeMap',opts);const afterMap=L.map('afterMap',{...opts,zoomControl:false,attributionControl:false,dragging:false,touchZoom:false,scrollWheelZoom:false,doubleClickZoom:false,boxZoom:false,keyboard:false});const common={minZoom:8,maxZoom:14,maxNativeZoom:14,tileSize:256,keepBuffer:6,updateWhenIdle:false,updateWhenZooming:false};L.tileLayer('tiles/before/{z}/{x}/{y}.webp',{...common,attribution:'Copernicus Sentinel‑2'}).addTo(beforeMap);let afterLayer=null,manifest=null,months=[],ratio=.5,dragging=false,raf=0;function sync(){raf=0;afterMap.setView(beforeMap.getCenter(),beforeMap.getZoom(),{animate:false,reset:false})}beforeMap.on('move zoom',()=>{if(!raf)raf=requestAnimationFrame(sync)});beforeMap.on('moveend zoomend',sync);const wrap=document.getElementById('afterWrap'),divider=document.getElementById('divider');function setRatio(v){ratio=Math.max(0,Math.min(1,v));wrap.style.clipPath=`inset(0 0 0 ${ratio*100}%)`;wrap.style.webkitClipPath=`inset(0 0 0 ${ratio*100}%)`;divider.style.left=(ratio*100)+'%'}function setX(x){const r=document.getElementById('stage').getBoundingClientRect();setRatio((x-r.left)/r.width)}function start(e){dragging=true;beforeMap.dragging.disable();if(beforeMap.touchZoom)beforeMap.touchZoom.disable();const x=e.clientX??e.touches?.[0]?.clientX;if(Number.isFinite(x))setX(x);e.preventDefault()}function move(e){if(!dragging)return;const x=e.clientX??e.touches?.[0]?.clientX;if(Number.isFinite(x))setX(x);e.preventDefault()}function end(e){if(!dragging)return;dragging=false;beforeMap.dragging.enable();if(beforeMap.touchZoom)beforeMap.touchZoom.enable();if(e)e.preventDefault()}divider.addEventListener('pointerdown',start,{passive:false});window.addEventListener('pointermove',move,{passive:false});window.addEventListener('pointerup',end,{passive:false});divider.addEventListener('touchstart',start,{passive:false});window.addEventListener('touchmove',move,{passive:false});window.addEventListener('touchend',end,{passive:false});L.DomEvent.disableClickPropagation(divider);document.getElementById('showBefore').onclick=()=>setRatio(1);document.getElementById('split').onclick=()=>setRatio(.5);document.getElementById('showAfter').onclick=()=>setRatio(0);function prettyDate(iso){return new Intl.DateTimeFormat('en-GB',{day:'2-digit',month:'short',year:'numeric'}).format(new Date(iso))}function prettyMonth(key){const [y,m]=key.split('-').map(Number);return new Intl.DateTimeFormat('en-GB',{month:'long',year:'numeric'}).format(new Date(Date.UTC(y,m-1,1)))}function showMonth(index){const key=months[index],info=manifest.months[key];if(afterLayer)afterMap.removeLayer(afterLayer);afterLayer=L.tileLayer(`tiles/monthly/${key}/{z}/{x}/{y}.webp`,common).addTo(afterMap);const date=prettyDate(info.datetime);document.getElementById('monthTitle').textContent=prettyMonth(key);document.getElementById('monthMeta').textContent=`${date} · ${Number(info.cloud).toFixed(1)}% cloud`;document.getElementById('laterPill').textContent=`Selected: ${date}`;document.getElementById('rightLabel').textContent=date;document.getElementById('status').textContent=`Scene ${info.id}`;localStorage.setItem('timelineMonth',key);sync()}fetch('tiles/manifest.json').then(r=>{if(!r.ok)throw new Error('manifest missing');return r.json()}).then(j=>{manifest=j;months=Object.keys(j.months||{}).sort();if(!months.length)throw new Error('no monthly scenes');const slider=document.getElementById('monthSlider');slider.max=String(months.length-1);slider.disabled=false;document.getElementById('firstMonth').textContent=prettyMonth(months[0]);document.getElementById('lastMonth').textContent=prettyMonth(months.at(-1));const saved=localStorage.getItem('timelineMonth');const start=Math.max(0,saved?months.indexOf(saved):months.length-1);slider.value=String(start);slider.addEventListener('input',e=>showMonth(Number(e.target.value)));showMonth(start)}).catch(()=>{document.getElementById('status').textContent='Monthly tiles are not generated yet. Run the GitHub workflow.';document.getElementById('monthTitle').textContent='Timeline unavailable'});document.getElementById('aboutBtn').onclick=()=>document.getElementById('aboutModal').style.display='flex';document.getElementById('closeAbout').onclick=()=>document.getElementById('aboutModal').style.display='none';document.getElementById('aboutModal').onclick=e=>{if(e.target.id==='aboutModal')e.currentTarget.style.display='none';};setRatio(.5);sync();
+</script>
+<script>
+(function(){
+  const satView=document.getElementById('satelliteView');
+  const casView=document.getElementById('casualtyView');
+  const satTab=document.getElementById('satTab');
+  const casTab=document.getElementById('casTab');
+
+  function switchView(which){
+    const casualty=which==='cas';
+    satView.classList.toggle('hidden',casualty);
+    casView.classList.toggle('active',casualty);
+    satTab.classList.toggle('active',!casualty);
+    casTab.classList.toggle('active',casualty);
+    if(!casualty){
+      setTimeout(()=>{try{beforeMap.invalidateSize();afterMap.invalidateSize();sync()}catch(e){}},80);
+    }
+  }
+  satTab.addEventListener('click',()=>switchView('sat'));
+  casTab.addEventListener('click',()=>switchView('cas'));
+
+  let rows=[];
+  const origin=new Date('2023-10-07T00:00:00Z');
+  const num=v=>v==null?'—':Number(v).toLocaleString('en-US');
+  const rate=v=>v==null||!Number.isFinite(v)?'—':v.toLocaleString('en-US',{maximumFractionDigits:1});
+  const pretty=s=>{
+    const d=new Date(s+'T12:00:00Z');
+    return new Intl.DateTimeFormat('en-GB',{day:'2-digit',month:'short',year:'numeric'}).format(d);
+  };
+  const days=(a,b)=>Math.max(0,Math.round((b-a)/86400000));
+
+  function show(i){
+    const r=rows[i],prev=i>0?rows[i-1]:null;
+    if(!r)return;
+    const d=new Date(r.date+'T00:00:00Z');
+    const totalDays=Math.max(1,days(origin,d));
+    const deltaDays=prev?Math.max(1,days(new Date(prev.date+'T00:00:00Z'),d)):null;
+    const kd=prev?r.killed-prev.killed:null;
+    const id=prev?r.injured-prev.injured:null;
+
+    document.getElementById('casAsOf').textContent=`As of ${pretty(r.date)} · ${r.series_label||'WHO update'}`;
+    document.getElementById('casKilled').textContent=num(r.killed);
+    document.getElementById('casInjured').textContent=num(r.injured);
+    document.getElementById('daysSince').textContent=num(totalDays);
+    document.getElementById('killedPerDay').textContent=rate(r.killed/totalDays);
+    document.getElementById('injuredPerDay').textContent=rate(r.injured/totalDays);
+    document.getElementById('daysDelta').textContent=deltaDays==null?'—':num(deltaDays);
+    document.getElementById('killedDelta').textContent=kd==null?'—':num(kd);
+    document.getElementById('injuredDelta').textContent=id==null?'—':num(id);
+    document.getElementById('killedDeltaRate').textContent=kd==null?'—':rate(kd/deltaDays);
+    document.getElementById('injuredDeltaRate').textContent=id==null?'—':rate(id/deltaDays);
+    document.getElementById('casSourceLink').href=r.source_url;
+    document.getElementById('casSelected').textContent=pretty(r.date);
+    document.getElementById('casSlider').value=String(i);
+  }
+
+  fetch('data/casualty-timeline.json',{cache:'no-store'})
+    .then(r=>{if(!r.ok)throw new Error('data not generated');return r.json()})
+    .then(data=>{
+      rows=(data.records||[]).sort((a,b)=>new Date(a.date)-new Date(b.date));
+      if(!rows.length)throw new Error('no casualty records');
+      const slider=document.getElementById('casSlider');
+      slider.max=String(rows.length-1);slider.disabled=false;
+      slider.addEventListener('input',e=>show(Number(e.target.value)));
+      document.getElementById('casFirst').textContent=pretty(rows[0].date);
+      document.getElementById('casLast').textContent=pretty(rows.at(-1).date);
+      document.getElementById('casCount').textContent=`${rows.length} verified WHO reports`;
+      show(rows.length-1);
+    })
+    .catch(()=>{
+      document.getElementById('casAsOf').textContent='Casualty data has not been generated yet.';
+      document.getElementById('casSelected').textContent='Run the Update Gaza casualty timeline workflow once.';
+    });
+})();
+</script>
+</body></html>
