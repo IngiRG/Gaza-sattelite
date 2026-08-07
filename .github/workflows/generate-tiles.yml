@@ -92,14 +92,13 @@ jobs:
           def lonx(lon,z): return int((lon+180)/360*(1<<z))
           def laty(lat,z):
               radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
-          TILE_PADDING=1
           def coords():
               west,south,east,north=BBOX
               for z in ZOOMS:
-                  x0=lonx(west,z)-TILE_PADDING
-                  x1=lonx(east,z)+TILE_PADDING
-                  y0=laty(north,z)-TILE_PADDING
-                  y1=laty(south,z)+TILE_PADDING
+                  x0=lonx(west,z)
+                  x1=lonx(east,z)
+                  y0=laty(north,z)
+                  y1=laty(south,z)
                   for x in range(x0,x1+1):
                       for y in range(y0,y1+1):
                           yield z,x,y
@@ -125,6 +124,25 @@ jobs:
               if mask.ndim==3:
                   mask=mask[0]
               return data,mask>0
+
+          def bbox_pixel_mask(x,y,z):
+              # Mask each edge tile to the exact BBOX so every zoom level
+              # shows precisely the same geographic extent.
+              size=256
+              world=size*(1<<z)
+
+              pixel_x=x*size+np.arange(size)+0.5
+              pixel_y=y*size+np.arange(size)+0.5
+
+              lon=pixel_x/world*360.0-180.0
+              mercator_y=np.pi*(1.0-2.0*pixel_y/world)
+              lat=np.degrees(np.arctan(np.sinh(mercator_y)))
+
+              west,south,east,north=BBOX
+              lon_ok=(lon>=west)&(lon<=east)
+              lat_ok=(lat>=south)&(lat<=north)
+
+              return lat_ok[:,None]&lon_ok[None,:]
 
           def render(label,item,backup=None,force=False):
               folder=OUT/label
@@ -158,6 +176,11 @@ jobs:
                                   rgb[:,take]=backup_data[:,take]
                                   valid|=take
 
+                          # Pixels outside the configured BBOX are always
+                          # transparent, even when the containing map tile
+                          # extends farther north, south, east or west.
+                          valid &= bbox_pixel_mask(x,y,z)
+
                           rgba=np.zeros((256,256,4),dtype=np.uint8)
                           rgba[:,:,:3]=np.moveaxis(rgb,0,2)
                           rgba[:,:,3]=valid.astype(np.uint8)*255
@@ -177,8 +200,8 @@ jobs:
           if manifest_path.exists():
               try:old_manifest=json.loads(manifest_path.read_text())
               except Exception:old_manifest={}
-          before=get_item(BEFORE_ID);render("before",before,None,force=old_manifest.get("before",{}).get("id")!=before["id"])
-          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
+          before=get_item(BEFORE_ID);render("before",before,None,force=(old_manifest.get("bbox_mode")!="exact" or old_manifest.get("before",{}).get("id")!=before["id"]))
+          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox_mode":"exact","bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
           for key,year,month in month_keys():
               selected,backup=choose_month(search_month(year,month))
               if selected is None:
@@ -188,7 +211,7 @@ jobs:
                   f"monthly/{key}",
                   selected,
                   backup,
-                  force=previous.get("id")!=selected["id"]
+                  force=(old_manifest.get("bbox_mode")!="exact" or previous.get("id")!=selected["id"])
               )
               manifest["months"][key]={
                   "id":selected["id"],
