@@ -1,0 +1,120 @@
+{
+  "source": "UN OCHA oPt pages citing Gaza Ministry of Health cumulative casualty totals",
+  "method": "Only exact passages explicitly covering the period from 7 October 2023 and containing both cumulative killed and injured totals are accepted.",
+  "updated_at": "2026-08-07T21:16:10.408350+00:00",
+  "parser_version": 1,
+  "records": [
+    {
+      "date": "2024-01-08",
+      "killed": 45936,
+      "injured": 109274,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-253-gaza-strip",
+      "series_label": "Situation Update #253"
+    },
+    {
+      "date": "2025-01-22",
+      "killed": 47161,
+      "injured": 111166,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-257-gaza-strip",
+      "series_label": "Situation Update #257"
+    },
+    {
+      "date": "2025-01-28",
+      "killed": 47354,
+      "injured": 111563,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-259-gaza-strip",
+      "series_label": "Situation Update #259"
+    },
+    {
+      "date": "2025-05-07",
+      "killed": 52653,
+      "injured": 118897,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-286-gaza-strip",
+      "series_label": "Situation Update #286"
+    },
+    {
+      "date": "2025-05-14",
+      "killed": 52928,
+      "injured": 119846,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-288-gaza-strip",
+      "series_label": "Situation Update #288"
+    },
+    {
+      "date": "2025-05-21",
+      "killed": 53655,
+      "injured": 121950,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-290-gaza-strip",
+      "series_label": "Situation Update #290"
+    },
+    {
+      "date": "2025-06-04",
+      "killed": 54607,
+      "injured": 125341,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-294-gaza-strip",
+      "series_label": "Situation Update #294"
+    },
+    {
+      "date": "2025-06-11",
+      "killed": 55104,
+      "injured": 127394,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-296-gaza-strip",
+      "series_label": "Situation Update #296"
+    },
+    {
+      "date": "2025-06-18",
+      "killed": 55637,
+      "injured": 129880,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-297-gaza-strip",
+      "series_label": "Situation Update #297"
+    },
+    {
+      "date": "2025-06-25",
+      "killed": 56156,
+      "injured": 132239,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-300-gaza-strip",
+      "series_label": "Situation Update #300"
+    },
+    {
+      "date": "2025-07-02",
+      "killed": 57012,
+      "injured": 134592,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-302-gaza-strip",
+      "series_label": "Situation Update #302"
+    },
+    {
+      "date": "2025-07-09",
+      "killed": 57680,
+      "injured": 137409,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-304-gaza-strip",
+      "series_label": "Situation Update #304"
+    },
+    {
+      "date": "2025-07-16",
+      "killed": 58573,
+      "injured": 139607,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-306-gaza-strip",
+      "series_label": "Situation Update #306"
+    },
+    {
+      "date": "2025-07-23",
+      "killed": 59219,
+      "injured": 143045,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-307-gaza-strip",
+      "series_label": "Situation Update #307"
+    },
+    {
+      "date": "2025-07-30",
+      "killed": 60138,
+      "injured": 146269,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-309-gaza-strip",
+      "series_label": "Situation Update #309"
+    },
+    {
+      "date": "2025-10-07",
+      "killed": 67173,
+      "injured": 169780,
+      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-329-gaza-strip",
+      "series_label": "Situation Update #329"
+    }
+  ]
+}
