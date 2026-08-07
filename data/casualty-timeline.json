@@ -1,79 +1,48 @@
 {
   "source": "UN OCHA oPt Gaza updates; Palestinian casualty totals attributed by OCHA to the Gaza Ministry of Health.",
-  "updated_at": "2026-08-07T21:55:33.538533+00:00",
-  "parser_version": 5,
+  "method": "Context-based extraction of cumulative killed/injured pairs near Gaza/MoH casualty language, with ambiguity, monotonicity, and jump checks.",
+  "updated_at": "2026-08-07T22:03:38.916840+00:00",
+  "parser_version": 6,
   "records": [
     {
-      "date": "2023-10-07",
-      "killed": 67183,
-      "injured": 169841,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-329-gaza-strip",
-      "series_label": "Situation Update #329",
-      "parser_version": 5
+      "date": "2023-10-08",
+      "killed": 159,
+      "injured": 1210,
+      "source_url": "https://www.ochaopt.org/content/escalation-gaza-strip-and-israel-flash-update-2",
+      "series_label": "Flash Update #2",
+      "parser_version": 6
     },
     {
-      "date": "2025-10-16",
-      "killed": 67938,
-      "injured": 170169,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-331-gaza-strip",
-      "series_label": "Situation Update #331",
-      "parser_version": 5
+      "date": "2023-10-16",
+      "killed": 558,
+      "injured": 27490,
+      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-36",
+      "series_label": "Flash Update #36",
+      "parser_version": 6
     },
     {
-      "date": "2025-10-19",
-      "killed": 69185,
-      "injured": 170698,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-340-gaza-strip",
-      "series_label": "Situation Update #340",
-      "parser_version": 5
+      "date": "2023-11-02",
+      "killed": 558,
+      "injured": 27490,
+      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-35",
+      "series_label": "Flash Update #35",
+      "parser_version": 6
     },
     {
-      "date": "2025-11-20",
-      "killed": 69513,
-      "injured": 170745,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-342-gaza-strip",
-      "series_label": "Situation Update #342",
-      "parser_version": 5
+      "date": "2023-12-06",
+      "killed": 18608,
+      "injured": 50594,
+      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-68",
+      "series_label": "Flash Update #68",
+      "parser_version": 6
     },
     {
-      "date": "2025-11-27",
-      "killed": 69785,
-      "injured": 170965,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-344-gaza-strip",
-      "series_label": "Situation Update #344",
-      "parser_version": 5
-    },
-    {
-      "date": "2025-12-04",
-      "killed": 70117,
-      "injured": 170999,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-345-gaza-strip",
-      "series_label": "Situation Update #345",
-      "parser_version": 5
-    },
-    {
-      "date": "2025-12-11",
-      "killed": 70369,
-      "injured": 171069,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-347-gaza-strip",
-      "series_label": "Situation Update #347",
-      "parser_version": 5
-    },
-    {
-      "date": "2026-01-28",
-      "killed": 71667,
-      "injured": 171343,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-355-gaza-strip",
-      "series_label": "Situation Update #355",
-      "parser_version": 5
-    },
-    {
-      "date": "2026-02-12",
-      "killed": 72045,
-      "injured": 171686,
-      "source_url": "https://www.ochaopt.org/content/humanitarian-situation-update-357-gaza-strip",
-      "series_label": "Situation Update #357",
-      "parser_version": 5
+      "date": "2024-02-07",
+      "killed": 67147,
+      "injured": 300000,
+      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-113",
+      "series_label": "Flash Update #113",
+      "parser_version": 6
     }
   ]
 }
