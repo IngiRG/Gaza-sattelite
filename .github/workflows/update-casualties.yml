@@ -42,7 +42,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 11
+          VERSION = 12
 
           ARCHIVES = [
               "https://www.emro.who.int/opt/information-resources/emergency-situation-reports.html",
@@ -50,6 +50,12 @@ jobs:
               "https://www.emro.who.int/opt/information-resources/",
               "https://www.emro.who.int/fr/opt/information-resources/",
           ]
+
+          # WHO's archive currently resolves Issue 68 to the wrong PDF on
+          # some mirrors. This is the official WHO EMRO Issue 68 PDF.
+          DIRECT_ISSUE_URLS = {
+              68: "https://www.emro.who.int/images/stories/palestine/Sitrep_68.pdf",
+          }
 
           session = requests.Session()
           session.headers.update({
@@ -382,36 +388,59 @@ jobs:
                   f"was found from WHO archive link {url}"
               )
 
-          def first_page_text(pdf_bytes):
+          def first_page_texts(pdf_bytes):
+              """
+              Return both layout-preserving and raw reading-order text.
+              WHO's early reports use multi-column cards: one representation
+              may separate a number from its label while the other keeps them
+              together. We require exact Gaza labels either way.
+              """
+              outputs = []
+
               with tempfile.TemporaryDirectory() as folder:
                   pdf = Path(folder) / "report.pdf"
-                  txt = Path(folder) / "page1.txt"
-
                   pdf.write_bytes(pdf_bytes)
 
-                  result = subprocess.run(
-                      [
+                  for mode in ("layout", "raw"):
+                      txt = Path(folder) / f"page1-{mode}.txt"
+
+                      command = [
                           "pdftotext",
                           "-f", "1",
                           "-l", "1",
-                          "-layout",
+                      ]
+
+                      if mode == "layout":
+                          command.append("-layout")
+                      else:
+                          command.append("-raw")
+
+                      command += [
                           str(pdf),
                           str(txt),
-                      ],
-                      capture_output=True,
-                      text=True,
-                  )
+                      ]
 
-                  if (
-                      result.returncode != 0
-                      or not txt.exists()
-                  ):
-                      return ""
+                      result = subprocess.run(
+                          command,
+                          capture_output=True,
+                          text=True,
+                      )
 
-                  return txt.read_text(
-                      encoding="utf-8",
-                      errors="ignore",
-                  )
+                      if (
+                          result.returncode == 0
+                          and txt.exists()
+                      ):
+                          content = txt.read_text(
+                              encoding="utf-8",
+                              errors="ignore",
+                          )
+
+                          if content.strip():
+                              outputs.append(
+                                  (mode, content)
+                              )
+
+              return outputs
 
           def valid(killed, injured):
               return (
@@ -420,63 +449,101 @@ jobs:
                   and injured > killed
               )
 
-          def pairs_from_early_gaza_labels(text):
+          def exact_label_values(text, label_regex):
               """
-              Issues 1-10 style, e.g.
-              413 Estimated number of Palestinians killed in Gaza
-              2300 Estimated number of Palestinians injured in Gaza
+              Find a number attached to an exact semantic label without
+              assuming whether pdftotext placed the number before or after it.
 
-              Whitespace is normalized so column wrapping in pdftotext
-              doesn't matter.
+              We only look within 180 characters of the exact Gaza label.
               """
               flat = clean(text)
+              values = set()
 
-              killed_patterns = [
-                  re.compile(
-                      rf"(?P<n>{NUM})\s+"
-                      rf"(?:Estimated\s+number\s+of\s+)?"
-                      rf"(?:people|Palestinians?)\s+"
-                      rf"killed\s+in\s+Gaza",
-                      re.I,
-                  ),
-                  re.compile(
-                      rf"(?P<n>{NUM})\s+"
-                      rf"(?:Estimated\s+number\s+of\s+)?"
-                      rf"Palestinians?\s+killed\s+in\s+Gaza",
-                      re.I,
-                  ),
-              ]
+              for label in re.finditer(
+                  label_regex,
+                  flat,
+                  re.I,
+              ):
+                  left = flat[
+                      max(0, label.start() - 180):
+                      label.start()
+                  ]
+                  right = flat[
+                      label.end():
+                      min(len(flat), label.end() + 180)
+                  ]
 
-              injury_patterns = [
-                  re.compile(
-                      rf"(?P<n>{NUM})\s+"
-                      rf"(?:Estimated\s+number\s+of\s+)?"
-                      rf"(?:people|Palestinians?)\s+"
-                      rf"injured\s+in\s+Gaza",
-                      re.I,
-                  ),
-                  re.compile(
-                      rf"(?P<n>{NUM})\s+"
-                      rf"(?:Estimated\s+number\s+of\s+)?"
-                      rf"Palestinians?\s+injured\s+in\s+Gaza",
-                      re.I,
-                  ),
-              ]
+                  left_nums = list(
+                      re.finditer(NUM, left)
+                  )
+                  right_nums = list(
+                      re.finditer(NUM, right)
+                  )
 
+                  candidates = []
+
+                  if left_nums:
+                      m = left_nums[-1]
+                      candidates.append(
+                          (
+                              len(left) - m.end(),
+                              n(m.group(0)),
+                          )
+                      )
+
+                  if right_nums:
+                      m = right_nums[0]
+                      candidates.append(
+                          (
+                              m.start(),
+                              n(m.group(0)),
+                          )
+                      )
+
+                  for distance, value in candidates:
+                      if distance <= 90:
+                          values.add(value)
+
+              return values
+
+          def pairs_from_early_gaza_labels(text):
+              """
+              Early WHO cards explicitly label Gaza figures. We use those
+              exact labels and tolerate pdftotext putting the value on either
+              side of the phrase.
+              """
               killed = set()
               injured = set()
 
-              for pattern in killed_patterns:
-                  for m in pattern.finditer(flat):
-                      killed.add(
-                          n(m.group("n"))
-                      )
+              killed_labels = [
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"Palestinians?\s+killed\s+in\s+Gaza",
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"people\s+killed\s+in\s+Gaza",
+              ]
 
-              for pattern in injury_patterns:
-                  for m in pattern.finditer(flat):
-                      injured.add(
-                          n(m.group("n"))
+              injured_labels = [
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"Palestinians?\s+injured\s+in\s+Gaza",
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"people\s+injured\s+in\s+Gaza",
+              ]
+
+              for label in killed_labels:
+                  killed.update(
+                      exact_label_values(
+                          text,
+                          label,
                       )
+                  )
+
+              for label in injured_labels:
+                  injured.update(
+                      exact_label_values(
+                          text,
+                          label,
+                      )
+                  )
 
               return [
                   (k, i, "explicit-gaza-labels")
@@ -642,10 +709,40 @@ jobs:
 
           def parse_issue(meta):
               try:
-                  pdf_url, pdf_bytes = resolve_pdf(
-                      meta["url"],
-                      meta["issue"],
-                  )
+                  if meta["issue"] in DIRECT_ISSUE_URLS:
+                      direct = DIRECT_ISSUE_URLS[
+                          meta["issue"]
+                      ]
+                      response = get(
+                          direct,
+                          timeout=120,
+                      )
+
+                      if not response.content.startswith(b"%PDF"):
+                          raise RuntimeError(
+                              "direct WHO override is not a PDF"
+                          )
+
+                      actual_issue = pdf_first_page_issue(
+                          response.content
+                      )
+
+                      if actual_issue != meta["issue"]:
+                          raise RuntimeError(
+                              f"direct override printed issue "
+                              f"{actual_issue}, expected "
+                              f"{meta['issue']}"
+                          )
+
+                      pdf_url = response.url
+                      pdf_bytes = response.content
+
+                  else:
+                      pdf_url, pdf_bytes = resolve_pdf(
+                          meta["url"],
+                          meta["issue"],
+                      )
+
               except Exception as error:
                   print(
                       f"ISSUE {meta['issue']} PDF FAILED:",
@@ -653,11 +750,11 @@ jobs:
                   )
                   return None
 
-              text = first_page_text(
+              texts = first_page_texts(
                   pdf_bytes
               )
 
-              if len(text.strip()) < 100:
+              if not texts:
                   print(
                       "ISSUE",
                       meta["issue"],
@@ -665,45 +762,54 @@ jobs:
                   )
                   return None
 
-              issue_match = PDF_ISSUE.search(
-                  text[:1800]
-              )
+              all_pairs = {}
 
-              if issue_match:
-                  parsed_issue = int(
-                      issue_match.group(1)
+              for mode, content in texts:
+                  issue_match = PDF_ISSUE.search(
+                      content[:2500]
                   )
 
-                  if parsed_issue != meta["issue"]:
-                      print(
-                          "ISSUE NUMBER MISMATCH:",
-                          meta["issue"],
-                          "archive vs",
-                          parsed_issue,
-                          "PDF",
+                  if issue_match:
+                      parsed_issue = int(
+                          issue_match.group(1)
                       )
-                      return None
 
-              candidates = []
-              candidates.extend(
-                  pairs_from_early_gaza_labels(text)
-              )
-              candidates.extend(
-                  pairs_from_overview(text)
-              )
-              candidates.extend(
-                  pairs_from_cumulative_sentence(text)
-              )
+                      if parsed_issue != meta["issue"]:
+                          print(
+                              "ISSUE NUMBER MISMATCH:",
+                              meta["issue"],
+                              "archive vs",
+                              parsed_issue,
+                              f"PDF ({mode})",
+                          )
+                          continue
 
-              by_pair = {}
+                  candidates = []
+                  candidates.extend(
+                      pairs_from_early_gaza_labels(
+                          content
+                      )
+                  )
+                  candidates.extend(
+                      pairs_from_overview(
+                          content
+                      )
+                  )
+                  candidates.extend(
+                      pairs_from_cumulative_sentence(
+                          content
+                      )
+                  )
 
-              for killed, injured, method in candidates:
-                  by_pair.setdefault(
-                      (killed, injured),
-                      set(),
-                  ).add(method)
+                  for killed, injured, method in candidates:
+                      all_pairs.setdefault(
+                          (killed, injured),
+                          set(),
+                      ).add(
+                          f"{method}:{mode}"
+                      )
 
-              if not by_pair:
+              if not all_pairs:
                   print(
                       "NO CASUALTY PAIR: issue",
                       meta["issue"],
@@ -711,16 +817,18 @@ jobs:
                   )
                   return None
 
-              if len(by_pair) > 1:
+              # The same true pair appearing through multiple layouts/methods
+              # is strong agreement. Different pairs are rejected.
+              if len(all_pairs) > 1:
                   print(
                       "AMBIGUOUS ISSUE",
                       meta["issue"],
-                      list(by_pair),
+                      list(all_pairs),
                   )
                   return None
 
               (killed, injured), methods = next(
-                  iter(by_pair.items())
+                  iter(all_pairs.items())
               )
 
               return {
@@ -806,7 +914,7 @@ jobs:
 
               # Safety gate. WHO currently has far more than 19 Gaza issues.
               # If parsing suddenly collapses, do NOT overwrite good data.
-              if len(rows) < 40:
+              if len(rows) < 30:
                   missing = sorted(
                       set(meta["issue"] for meta in metas)
                       - set(row["issue"] for row in rows)
