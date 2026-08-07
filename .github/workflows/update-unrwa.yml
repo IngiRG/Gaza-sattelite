@@ -1,0 +1,355 @@
+name: Update UNRWA timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scraper
+        run: pip install requests beautifulsoup4
+
+      - name: Fetch official UNRWA Situation Reports
+        shell: bash
+        run: |
+          cat > /tmp/update_unrwa.py <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import json
+          import re
+          import time
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+
+          BASE = "https://www.unrwa.org"
+          LISTING = BASE + "/resources/reports"
+          OUT = Path("data/unrwa-reports.json")
+          SCRAPER_VERSION = 1
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "DestructionVisualized-UNRWA-timeline/1.0 (+public research visualization)",
+              "Accept-Language": "en",
+          })
+
+          REPORT_RE = re.compile(r"UNRWA\s+Situation\s+Report\s+#\s*(\d+)", re.I)
+
+          def clean(text):
+              return re.sub(r"\s+", " ", text or "").strip()
+
+          def number(text):
+              if text is None:
+                  return None
+              m = re.search(r"(\d[\d,]*)", text)
+              return int(m.group(1).replace(",", "")) if m else None
+
+          def discover():
+              found = {}
+              no_match_streak = 0
+
+              # The Gaza series is mixed with other UNRWA reports, so walk
+              # backwards through enough listing pages to reach October 2023.
+              for page in range(0, 55):
+                  response = session.get(LISTING, params={"page": page}, timeout=45)
+                  response.raise_for_status()
+                  soup = BeautifulSoup(response.text, "html.parser")
+                  matches_this_page = 0
+
+                  for a in soup.find_all("a", href=True):
+                      title = clean(a.get_text(" ", strip=True))
+                      m = REPORT_RE.search(title)
+                      if not m:
+                          continue
+                      if "gaza" not in title.lower():
+                          continue
+
+                      url = urljoin(BASE, a["href"].split("?")[0])
+                      n = int(m.group(1))
+                      found[url] = {"number": n, "title": title, "url": url}
+                      matches_this_page += 1
+
+                  if matches_this_page:
+                      no_match_streak = 0
+                  else:
+                      no_match_streak += 1
+
+                  # Once report #1 has been discovered we have the full series.
+                  if any(v["number"] == 1 for v in found.values()):
+                      break
+
+                  # Avoid walking forever if the site changes its pagination.
+                  if page > 30 and no_match_streak >= 8:
+                      break
+
+                  time.sleep(0.12)
+
+              return sorted(found.values(), key=lambda x: x["number"])
+
+          def published_date(soup, text):
+              time_tag = soup.find("time")
+              if time_tag:
+                  raw = time_tag.get("datetime") or time_tag.get_text(" ", strip=True)
+                  if raw:
+                      try:
+                          return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+                      except Exception:
+                          pass
+
+              meta = soup.find("meta", attrs={"property": "article:published_time"})
+              if meta and meta.get("content"):
+                  try:
+                      return datetime.fromisoformat(meta["content"].replace("Z", "+00:00")).date().isoformat()
+                  except Exception:
+                      pass
+
+              # Common UNRWA page date format.
+              m = re.search(
+                  r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
+                  r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+                  r"(\d{1,2}),\s+(20\d{2})\b",
+                  text,
+                  re.I,
+              )
+              if m:
+                  return datetime.strptime(
+                      f"{m.group(1)} {m.group(2)} {m.group(3)}",
+                      "%B %d %Y",
+                  ).date().isoformat()
+
+              return None
+
+          def reporting_period(text):
+              patterns = [
+                  r"All information (?:updated|valid) for\s+([^.\n]{4,90})",
+                  r"All information valid as of\s+([^.\n]{4,90})",
+                  r"All information updated as of\s+([^.\n]{4,90})",
+              ]
+              for p in patterns:
+                  m = re.search(p, text, re.I)
+                  if m:
+                      return clean(m.group(1))
+              return None
+
+          def sentence_candidates(text):
+              # Newlines are useful because UNRWA's page layout often places
+              # key-figure statements on their own line.
+              chunks = re.split(r"(?<=[.!?])\s+|\n+", text)
+              return [clean(c) for c in chunks if 20 <= len(clean(c)) <= 900]
+
+          def best_casualty(sentences, word):
+              values = []
+              pattern = re.compile(
+                  rf"(?:(?:at least|more than|over|approximately|around)\s+)?"
+                  rf"(\d[\d,]*)\s+"
+                  rf"(?:Palestinians|people|persons|individuals|civilians)?\s*"
+                  rf"(?:have been|were|are|reportedly|reported as|reported to have been)?\s*"
+                  rf"{word}\b",
+                  re.I,
+              )
+
+              for s in sentences:
+                  low = s.lower()
+                  if word not in low:
+                      continue
+                  if "unrwa staff" in low or "staff members" in low or "unrwa colleague" in low:
+                      continue
+
+                  context = (
+                      "gaza" in low
+                      or "ministry of health" in low
+                      or "moh" in low
+                      or "ocha" in low
+                  )
+                  if not context:
+                      continue
+
+                  for m in pattern.finditer(s):
+                      v = int(m.group(1).replace(",", ""))
+                      if v > 20:
+                          values.append((v, s))
+
+              if not values:
+                  return None, None
+
+              # General cumulative casualty figures are normally much larger
+              # than subgroup figures. Taking the largest matching cumulative
+              # value is more conservative than guessing among smaller counts.
+              values.sort(key=lambda x: x[0], reverse=True)
+              return values[0]
+
+          def staff_killed(sentences):
+              vals = []
+              for s in sentences:
+                  low = s.lower()
+                  if "unrwa" not in low or "staff" not in low or "killed" not in low:
+                      continue
+                  for pat in [
+                      r"(\d[\d,]*)\s+(?:UNRWA\s+)?staff(?: members)?(?: have been| were| reportedly)? killed",
+                      r"(?:death toll among UNRWA staff|UNRWA staff killed)[^\d]{0,35}(\d[\d,]*)",
+                  ]:
+                      m = re.search(pat, s, re.I)
+                      if m:
+                          vals.append(int(m.group(1).replace(",", "")))
+              return max(vals) if vals else None
+
+          def installations(sentences):
+              vals = []
+              for s in sentences:
+                  low = s.lower()
+                  if "unrwa" not in low:
+                      continue
+                  if "installation" not in low and "facility" not in low:
+                      continue
+                  if "damage" not in low and "impact" not in low and "hit" not in low:
+                      continue
+                  for m in re.finditer(r"(\d[\d,]*)\s+(?:UNRWA\s+)?(?:installations|facilities)", s, re.I):
+                      vals.append(int(m.group(1).replace(",", "")))
+              return max(vals) if vals else None
+
+          def sheltering(sentences):
+              candidates = []
+              for s in sentences:
+                  low = s.lower()
+                  if "shelter" not in low:
+                      continue
+                  if "unrwa" not in low and "displaced" not in low:
+                      continue
+
+                  nums = [
+                      int(x.replace(",", ""))
+                      for x in re.findall(r"\b\d[\d,]{2,}\b", s)
+                  ]
+                  if nums:
+                      candidates.append((max(nums), s))
+
+              if not candidates:
+                  return None
+
+              candidates.sort(key=lambda x: x[0], reverse=True)
+              value, sentence = candidates[0]
+              # Store a short factual rendering, not the original report prose.
+              return f"{value:,} people (figure associated with sheltering/displacement in this report)"
+
+          def parse_report(meta):
+              response = session.get(meta["url"], timeout=60)
+              response.raise_for_status()
+              soup = BeautifulSoup(response.text, "html.parser")
+
+              # Remove menus/scripts to reduce false matches.
+              for tag in soup(["script", "style", "nav", "header", "footer"]):
+                  tag.decompose()
+
+              text = soup.get_text("\n", strip=True)
+              sentences = sentence_candidates(text)
+
+              killed, killed_sentence = best_casualty(sentences, "killed")
+              injured, injured_sentence = best_casualty(sentences, "injured")
+
+              casualty_source = None
+              source_sentence = killed_sentence or injured_sentence
+              if source_sentence:
+                  low = source_sentence.lower()
+                  if "ministry of health" in low or "moh" in low:
+                      casualty_source = "Gaza Ministry of Health, as cited by UNRWA"
+                  elif "ocha" in low:
+                      casualty_source = "OCHA, as cited by UNRWA"
+                  else:
+                      casualty_source = "UNRWA Situation Report"
+
+              return {
+                  "number": meta["number"],
+                  "title": meta["title"],
+                  "url": meta["url"],
+                  "date": published_date(soup, text),
+                  "reporting_period": reporting_period(text),
+                  "killed": killed,
+                  "injured": injured,
+                  "casualty_source": casualty_source,
+                  "unrwa_staff_killed": staff_killed(sentences),
+                  "sheltering_text": sheltering(sentences),
+                  "installations_affected": installations(sentences),
+                  "scraper_version": SCRAPER_VERSION,
+              }
+
+          def main():
+              OUT.parent.mkdir(parents=True, exist_ok=True)
+
+              previous = {}
+              if OUT.exists():
+                  try:
+                      old = json.loads(OUT.read_text(encoding="utf-8"))
+                      previous = {
+                          r["url"]: r
+                          for r in old.get("reports", [])
+                          if r.get("url")
+                      }
+                  except Exception:
+                      previous = {}
+
+              discovered = discover()
+              if not discovered:
+                  raise RuntimeError("No Gaza UNRWA Situation Reports discovered. UNRWA page structure may have changed.")
+
+              reports = []
+              for i, meta in enumerate(discovered, 1):
+                  old = previous.get(meta["url"])
+                  if old and old.get("scraper_version") == SCRAPER_VERSION:
+                      reports.append(old)
+                      continue
+
+                  print(f"Fetching report #{meta['number']} ({i}/{len(discovered)})")
+                  try:
+                      reports.append(parse_report(meta))
+                  except Exception as error:
+                      print(f"Could not parse {meta['url']}: {error}")
+                      # Preserve previously parsed data if the page temporarily fails.
+                      if old:
+                          reports.append(old)
+                  time.sleep(0.18)
+
+              reports = [r for r in reports if r.get("date")]
+              reports.sort(key=lambda r: (r["date"], r["number"]))
+
+              payload = {
+                  "source": "UNRWA official Situation Reports",
+                  "source_index": LISTING,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "scraper_version": SCRAPER_VERSION,
+                  "reports": reports,
+              }
+
+              OUT.write_text(
+                  json.dumps(payload, indent=2, ensure_ascii=False),
+                  encoding="utf-8",
+              )
+              print(f"Wrote {len(reports)} reports to {OUT}")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python /tmp/update_unrwa.py
+
+      - name: Commit timeline data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/unrwa-reports.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update UNRWA Situation Report timeline"
+          git push
