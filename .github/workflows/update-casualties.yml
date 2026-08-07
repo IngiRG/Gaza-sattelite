@@ -42,19 +42,22 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 13
+          VERSION = 14
 
           ARCHIVES = [
+              # Canonical WHO Gaza Emergency Situation Reports archive.
               "https://www.emro.who.int/opt/information-resources/emergency-situation-reports.html",
-              "https://www.emro.who.int/fr/opt/information-resources/emergency-situation-reports.html",
-              "https://www.emro.who.int/opt/information-resources/",
-              "https://www.emro.who.int/fr/opt/information-resources/",
           ]
 
           # WHO's archive currently resolves Issue 68 to the wrong PDF on
           # some mirrors. This is the official WHO EMRO Issue 68 PDF.
           DIRECT_ISSUE_URLS = {
               68: "https://www.emro.who.int/images/stories/palestine/Sitrep_68.pdf",
+          }
+
+          VERIFIED_ISSUE_DATES = {
+              # WHO canonical archive: Issue 68, 31 March 2026.
+              68: "2026-03-31",
           }
 
           session = requests.Session()
@@ -157,19 +160,23 @@ jobs:
 
                       candidate = {
                           "issue": issue,
-                          "date": report_date,
+                          "date": VERIFIED_ISSUE_DATES.get(
+                              issue,
+                              report_date,
+                          ),
                           "url": href,
                           "archive_label": label,
                       }
 
-                      # Prefer links that visibly point to PDFs.
+                      # Canonical archive metadata is authoritative.
+                      # We may improve only the URL, never the issue/date.
                       if current is None:
                           issues[issue] = candidate
                       elif (
                           ".pdf" in href.lower()
                           and ".pdf" not in current["url"].lower()
                       ):
-                          issues[issue] = candidate
+                          current["url"] = href
 
               if not issues:
                   raise RuntimeError(
@@ -826,9 +833,16 @@ jobs:
 
               rows = validate(rows)
 
-              # Safety gate. WHO currently has far more than 19 Gaza issues.
-              # If parsing suddenly collapses, do NOT overwrite good data.
-              if len(rows) < 35:
+              print(
+                  "WHO parsing summary:",
+                  len(rows),
+                  "accepted records from",
+                  len(metas),
+                  "archive issues",
+              )
+
+              # Safety gate: never overwrite the timeline with a sparse parse.
+              if len(rows) < 30:
                   missing = sorted(
                       set(meta["issue"] for meta in metas)
                       - set(row["issue"] for row in rows)
