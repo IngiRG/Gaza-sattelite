@@ -23,7 +23,7 @@ jobs:
       - name: Install updater
         run: pip install requests beautifulsoup4
 
-      - name: Extract Gaza casualty totals from OCHA
+      - name: Build casualty timeline from OCHA
         shell: bash
         run: |
           cat > /tmp/update_casualties.py <<'PY'
@@ -38,11 +38,11 @@ jobs:
 
           BASE = "https://www.ochaopt.org/content/"
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 5
+          VERSION = 6
 
           session = requests.Session()
           session.headers.update({
-              "User-Agent": "DestructionVisualized-CasualtyTimeline/5.0",
+              "User-Agent": "DestructionVisualized-CasualtyTimeline/6.0",
               "Accept-Language": "en",
           })
 
@@ -51,12 +51,21 @@ jobs:
               "August|September|October|November|December"
           )
 
-          N = r"\d{1,3}(?:,\d{3})+|\d{3,6}"
+          NUMBER_RE = re.compile(
+              r"(?<![\d.])"
+              r"(\d{1,3}(?:,\d{3})+|\d{3,6})"
+              r"(?![\d])"
+          )
+
+          DATE_RE = re.compile(
+              rf"\b(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})\b",
+              re.I,
+          )
 
           def clean(text):
               return re.sub(r"\s+", " ", text or "").strip()
 
-          def number(raw):
+          def parse_num(raw):
               return int(raw.replace(",", ""))
 
           def fetch(url):
@@ -78,257 +87,316 @@ jobs:
                       soup.title.get_text(" ", strip=True)
                       if soup.title else ""
                   )
-
                   text = clean(
                       soup.get_text(" ", strip=True)
                   )
-
                   return title, text
 
               except Exception as error:
                   print("FETCH FAILED", url, error)
                   return None
 
-          def parse_date_word(raw):
-              try:
-                  return datetime.strptime(
-                      clean(raw),
-                      "%d %B %Y",
-                  ).date().isoformat()
-              except Exception:
-                  return None
+          def parse_page_date(title, text):
+              # Prefer title / page header date.
+              for haystack in (title, text[:1800]):
+                  matches = list(DATE_RE.finditer(haystack))
+                  if not matches:
+                      continue
 
-          def page_date(title, text):
-              # OCHA pages normally expose publication date near the title.
-              patterns = [
-                  rf"\b(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})\b",
-                  rf"\b(\d{{1,2}}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+20\d{{2}})\b",
-              ]
-
-              for haystack in (title, text[:1400]):
-                  for pattern in patterns:
-                      m = re.search(pattern, haystack, re.I)
-                      if not m:
+                  # Prefer the last date in the title/header; this avoids
+                  # accidentally selecting "7 October 2023" from a sentence.
+                  for m in reversed(matches):
+                      raw = m.group(1)
+                      try:
+                          d = datetime.strptime(
+                              raw, "%d %B %Y"
+                          ).date()
+                      except Exception:
                           continue
 
-                      raw = clean(m.group(1))
-
-                      for fmt in ("%d %B %Y", "%d %b %Y"):
-                          try:
-                              return datetime.strptime(
-                                  raw, fmt
-                              ).date().isoformat()
-                          except Exception:
-                              pass
+                      if d >= date(2023, 10, 8) and d <= date.today():
+                          return d.isoformat()
 
               return None
 
-          # FORMAT 1 — used extensively in 2024 / early 2025:
-          #
-          # Between 7 October 2023 and 30 December 2024,
-          # at least 45,541 Palestinians were killed and
-          # 108,338 were injured, according to MoH in Gaza.
-          BETWEEN = re.compile(
-              rf"Between\s+7\s+October\s+2023\s+and\s+"
-              rf"(?P<date>\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})"
-              rf"(?P<body>.{{0,500}}?)"
-              rf"(?P<k>{N})\s+Palestinians?\s+were\s+killed"
-              rf"(?P<middle>.{{0,180}}?)"
-              rf"(?P<i>{N})\s+(?:Palestinians?\s+)?were\s+injured"
-              rf"(?P<tail>.{{0,180}}?(?:MoH|Ministry\s+of\s+Health).{{0,80}}?Gaza|"
-              rf".{{0,180}}?according\s+to\s+(?:MoH|Ministry\s+of\s+Health).{{0,80}}?)",
-              re.I | re.S,
-          )
+          def split_chunks(text):
+              # Use overlapping windows around casualty keywords rather than
+              # relying on exact sentence punctuation.
+              low = text.lower()
+              positions = []
 
-          # FORMAT 2 — later OCHA updates:
-          #
-          # This brings the casualty toll among Palestinians since
-          # 7 October 2023, as reported by MoH, to
-          # 64,656 fatalities and 163,503 injuries.
-          TOLL = re.compile(
-              rf"(?:brings?|bringing)\s+the\s+casualty\s+toll"
-              rf".{{0,180}}?Palestinians?"
-              rf".{{0,180}}?since\s+7\s+October\s+2023"
-              rf".{{0,220}}?(?:MoH|Ministry\s+of\s+Health)"
-              rf".{{0,180}}?(?P<k>{N})\s+fatalit(?:y|ies)"
-              rf".{{0,120}}?(?P<i>{N})\s+injur(?:y|ies)",
-              re.I | re.S,
-          )
+              for keyword in (
+                  "killed",
+                  "injured",
+                  "fatalities",
+                  "injuries",
+                  "casualty toll",
+                  "ministry of health",
+                  "moh",
+              ):
+                  for m in re.finditer(keyword, low):
+                      positions.append(m.start())
 
-          # FORMAT 3 — early October 2023:
-          #
-          # As of 20:00, according to the Ministry of Health in Gaza,
-          # at least 413 Palestinians have been killed and 2,300 others injured.
-          EARLY_ASOF = re.compile(
-              rf"As\s+of\s+\d{{1,2}}:\d{{2}}"
-              rf".{{0,140}}?(?:MoH|Ministry\s+of\s+Health)"
-              rf".{{0,80}}?Gaza"
-              rf".{{0,160}}?(?P<k>{N})\s+Palestinians?"
-              rf"\s+(?:have\s+been|were)\s+killed"
-              rf".{{0,140}}?(?P<i>{N})\s+(?:others?\s+)?injured",
-              re.I | re.S,
-          )
+              windows = []
 
-          # FORMAT 4 — early Flash Updates:
-          #
-          # Since the start of hostilities, 2,808 Palestinians have been
-          # killed and 10,850 have been injured.
-          EARLY_SINCE = re.compile(
-              rf"Since\s+the\s+start\s+of\s+(?:the\s+)?hostilities"
-              rf".{{0,100}}?(?P<k>{N})\s+Palestinians?"
-              rf"\s+(?:have\s+been|were)\s+killed"
-              rf".{{0,120}}?(?P<i>{N})\s+(?:Palestinians?\s+)?"
-              rf"(?:have\s+been|were)?\s*injured",
-              re.I | re.S,
-          )
+              for pos in positions:
+                  start = max(0, pos - 450)
+                  end = min(len(text), pos + 650)
+                  chunk = clean(text[start:end])
+                  if len(chunk) >= 80:
+                      windows.append(chunk)
 
-          def valid(killed, injured):
-              return (
-                  100 <= killed <= 500000
-                  and 100 <= injured <= 1000000
-                  and injured > killed
+              # Deduplicate exact repeated windows.
+              return list(dict.fromkeys(windows))
+
+          def context_score(chunk):
+              low = chunk.lower()
+              score = 0
+
+              if "gaza" in low:
+                  score += 5
+
+              if "ministry of health" in low or re.search(r"\bmoh\b", low):
+                  score += 5
+
+              if "palestinian" in low:
+                  score += 3
+
+              if "7 october 2023" in low:
+                  score += 4
+
+              if "since 7 october" in low:
+                  score += 3
+
+              if "between 7 october 2023 and" in low:
+                  score += 4
+
+              if "casualty toll" in low:
+                  score += 2
+
+              if "reported" in low:
+                  score += 1
+
+              # Penalize likely subgroup/incident contexts.
+              penalties = (
+                  "unrwa staff",
+                  "staff killed",
+                  "children killed",
+                  "women killed",
+                  "journalists killed",
+                  "aid workers killed",
+                  "health workers killed",
+                  "israeli soldiers",
+                  "hostages",
+                  "west bank",
+                  "east jerusalem",
+                  "school was hit",
+                  "single incident",
               )
 
-          def parse_page(url, label, early=False):
-              result = fetch(url)
+              for p in penalties:
+                  if p in low:
+                      score -= 8
 
+              return score
+
+          def nearby_values(chunk, label):
+              low = chunk.lower()
+              out = []
+
+              if label == "killed":
+                  patterns = (
+                      r"\bkilled\b",
+                      r"\bfatalit(?:y|ies)\b",
+                  )
+              else:
+                  patterns = (
+                      r"\binjured\b",
+                      r"\binjur(?:y|ies)\b",
+                  )
+
+              label_positions = []
+
+              for pattern in patterns:
+                  for m in re.finditer(pattern, low):
+                      label_positions.append(m.start())
+
+              if not label_positions:
+                  return []
+
+              nums = [
+                  (m.start(), parse_num(m.group(1)))
+                  for m in NUMBER_RE.finditer(chunk)
+              ]
+
+              for label_pos in label_positions:
+                  for num_pos, value in nums:
+                      distance = abs(num_pos - label_pos)
+
+                      if distance > 180:
+                          continue
+
+                      out.append((distance, value))
+
+              out.sort(key=lambda x: x[0])
+              return out
+
+          def pick_pair(chunk):
+              score = context_score(chunk)
+              if score < 6:
+                  return None
+
+              killed_candidates = nearby_values(chunk, "killed")
+              injured_candidates = nearby_values(chunk, "injured")
+
+              if not killed_candidates or not injured_candidates:
+                  return None
+
+              pairs = []
+
+              for kd, killed in killed_candidates:
+                  if not (100 <= killed <= 500000):
+                      continue
+
+                  for idist, injured in injured_candidates:
+                      if not (100 <= injured <= 1000000):
+                          continue
+
+                      if injured <= killed:
+                          continue
+
+                      # Prefer close labels and large cumulative values.
+                      pair_score = (
+                          score * 1000
+                          - kd
+                          - idist
+                          + min(killed, 200000) / 1000
+                          + min(injured, 400000) / 1000
+                      )
+
+                      pairs.append(
+                          (pair_score, killed, injured)
+                      )
+
+              if not pairs:
+                  return None
+
+              pairs.sort(reverse=True)
+              best = pairs[0]
+
+              # If top two pairs are nearly tied but disagree, reject.
+              if len(pairs) > 1:
+                  second = pairs[1]
+                  if (
+                      abs(best[0] - second[0]) < 25
+                      and (best[1], best[2]) != (second[1], second[2])
+                  ):
+                      return None
+
+              return {
+                  "score": best[0],
+                  "killed": best[1],
+                  "injured": best[2],
+              }
+
+          def parse_page(url, label):
+              result = fetch(url)
               if not result:
                   return None
 
               title, text = result
-              matches = []
-
-              # Format 1 gives its own effective date.
-              for m in BETWEEN.finditer(text):
-                  killed = number(m.group("k"))
-                  injured = number(m.group("i"))
-                  effective = parse_date_word(
-                      m.group("date")
-                  )
-
-                  if effective and valid(killed, injured):
-                      matches.append((
-                          effective,
-                          killed,
-                          injured,
-                          "between-7-oct",
-                      ))
-
-              # Format 2 uses the OCHA page/update date.
-              for m in TOLL.finditer(text):
-                  killed = number(m.group("k"))
-                  injured = number(m.group("i"))
-                  effective = page_date(
-                      title,
-                      text,
-                  )
-
-                  if effective and valid(killed, injured):
-                      matches.append((
-                          effective,
-                          killed,
-                          injured,
-                          "casualty-toll",
-                      ))
-
-              # Early formats are ONLY allowed on the known Gaza Flash
-              # Update URL families. This prevents accidental use of Israeli
-              # or West Bank casualty sentences elsewhere on the site.
-              if early:
-                  effective = page_date(
-                      title,
-                      text,
-                  )
-
-                  for regex, method in (
-                      (EARLY_ASOF, "early-as-of"),
-                      (EARLY_SINCE, "early-since"),
-                  ):
-                      for m in regex.finditer(text):
-                          killed = number(m.group("k"))
-                          injured = number(m.group("i"))
-
-                          if (
-                              effective
-                              and effective >= "2023-10-08"
-                              and valid(killed, injured)
-                          ):
-                              matches.append((
-                                  effective,
-                                  killed,
-                                  injured,
-                                  method,
-                              ))
-
-              if not matches:
+              effective = parse_page_date(title, text)
+              if not effective:
                   return None
 
-              unique = {
-                  (d, k, i): method
-                  for d, k, i, method in matches
-              }
+              candidates = []
 
-              # Different totals on the same page = don't guess.
-              if len(unique) != 1:
-                  print(
-                      "AMBIGUOUS PAGE OMITTED",
-                      url,
-                      list(unique),
-                  )
+              for chunk in split_chunks(text):
+                  pair = pick_pair(chunk)
+                  if pair:
+                      pair["chunk"] = chunk
+                      candidates.append(pair)
+
+              if not candidates:
                   return None
 
-              (effective, killed, injured), method = next(
-                  iter(unique.items())
+              # Highest-confidence contextual pair wins.
+              candidates.sort(
+                  key=lambda row: row["score"],
+                  reverse=True,
               )
 
-              if effective > date.today().isoformat():
-                  return None
+              best = candidates[0]
+
+              # Extra guard: if another high-confidence candidate on the same
+              # page strongly disagrees, omit the page.
+              for other in candidates[1:4]:
+                  if (
+                      best["score"] - other["score"] < 60
+                      and (
+                          best["killed"] != other["killed"]
+                          or best["injured"] != other["injured"]
+                      )
+                  ):
+                      print(
+                          "AMBIGUOUS PAGE OMITTED",
+                          url,
+                          (best["killed"], best["injured"]),
+                          (other["killed"], other["injured"]),
+                      )
+                      return None
 
               return {
                   "date": effective,
-                  "killed": killed,
-                  "injured": injured,
+                  "killed": best["killed"],
+                  "injured": best["injured"],
                   "source_url": url,
                   "series_label": label,
-                  "parse_method": method,
+                  "confidence": round(best["score"], 2),
                   "parser_version": VERSION,
               }
 
           def targets():
               rows = []
 
-              # The first reports used "Escalation..." in the URL.
-              for n in range(1, 30):
+              # Early October 2023 "Escalation..." URLs.
+              for n in range(1, 40):
                   rows.append((
                       BASE
                       + "escalation-gaza-strip-and-israel-flash-update-"
                       + str(n),
                       f"Flash Update #{n}",
-                      True,
                   ))
 
-              # The longer-running early series used "Hostilities...".
-              for n in range(1, 190):
+              # Main early-war Flash Update series.
+              for n in range(1, 220):
                   rows.append((
                       BASE
                       + "hostilities-gaza-strip-and-israel-flash-update-"
                       + str(n),
                       f"Flash Update #{n}",
-                      True,
                   ))
 
-              # Later Gaza Humanitarian Situation Updates.
-              for n in range(150, 451):
+              # Humanitarian Situation Updates.
+              for n in range(120, 500):
                   rows.append((
                       BASE
                       + "humanitarian-situation-update-"
                       + str(n)
                       + "-gaza-strip",
                       f"Situation Update #{n}",
-                      False,
                   ))
 
-              # Some newer OCHA pages use date-based Situation Report URLs.
+              # Gaza humanitarian response reports.
+              for n in range(1, 160):
+                  rows.append((
+                      BASE
+                      + "gaza-humanitarian-response-situation-report-no-"
+                      + str(n),
+                      f"Gaza Humanitarian Response Report #{n}",
+                  ))
+
+              # Current date-based Situation Reports.
               current = date(2025, 10, 1)
               today = date.today()
 
@@ -344,7 +412,6 @@ jobs:
                       + "humanitarian-situation-report-"
                       + slug,
                       "Humanitarian Situation Report",
-                      False,
                   ))
 
                   current += timedelta(days=1)
@@ -353,6 +420,7 @@ jobs:
 
           def collect():
               todo = targets()
+
               print(
                   "Checking",
                   len(todo),
@@ -369,9 +437,8 @@ jobs:
                           parse_page,
                           url,
                           label,
-                          early,
                       ): url
-                      for url, label, early in todo
+                      for url, label in todo
                   }
 
                   done = 0
@@ -395,7 +462,9 @@ jobs:
                               row["date"],
                               row["killed"],
                               row["injured"],
-                              row["parse_method"],
+                              row["series_label"],
+                              "score",
+                              row["confidence"],
                           )
                           records.append(row)
 
@@ -410,66 +479,122 @@ jobs:
               return records
 
           def reconcile(records):
-              grouped = {}
+              by_date = {}
 
               for row in records:
-                  grouped.setdefault(
+                  by_date.setdefault(
                       row["date"],
                       [],
                   ).append(row)
 
-              output = []
+              selected = []
 
-              for effective in sorted(grouped):
-                  rows = grouped[effective]
+              for effective in sorted(by_date):
+                  rows = by_date[effective]
 
-                  pairs = {
-                      (
+                  # Group identical pairs.
+                  groups = {}
+
+                  for row in rows:
+                      key = (
                           row["killed"],
                           row["injured"],
                       )
-                      for row in rows
-                  }
+                      groups.setdefault(
+                          key,
+                          [],
+                      ).append(row)
 
-                  if len(pairs) != 1:
-                      print(
-                          "CONFLICTING DATE OMITTED",
-                          effective,
-                          pairs,
-                      )
-                      continue
+                  # Prefer the pair supported by the most OCHA pages on that
+                  # date; confidence breaks ties.
+                  ranked = sorted(
+                      groups.items(),
+                      key=lambda item: (
+                          len(item[1]),
+                          max(r["confidence"] for r in item[1]),
+                      ),
+                      reverse=True,
+                  )
 
-                  # Prefer later structured OCHA update series over duplicate
-                  # Flash Update pages carrying the same totals.
-                  rows.sort(
+                  best_pair, best_rows = ranked[0]
+
+                  if len(ranked) > 1:
+                      second_pair, second_rows = ranked[1]
+
+                      if (
+                          len(best_rows) == len(second_rows)
+                          and abs(
+                              max(r["confidence"] for r in best_rows)
+                              - max(r["confidence"] for r in second_rows)
+                          ) < 50
+                      ):
+                          print(
+                              "DATE CONFLICT OMITTED",
+                              effective,
+                              best_pair,
+                              second_pair,
+                          )
+                          continue
+
+                  # Prefer a Situation Update source when available.
+                  best_rows.sort(
                       key=lambda row: (
                           "Situation Update"
                           not in row["series_label"]
                           and "Humanitarian Situation Report"
                           not in row["series_label"],
+                          -row["confidence"],
                           row["source_url"],
                       )
                   )
 
-                  output.append(rows[0])
+                  selected.append(best_rows[0])
 
-              # Cumulative totals can be revised, but a parser-generated
-              # backwards jump is much more likely to be wrong. Omit it rather
-              # than modifying OCHA's source number.
+              # Validate cumulative progression.
               final = []
 
-              for row in output:
+              for row in selected:
                   if final:
-                      previous = final[-1]
+                      prev = final[-1]
 
                       if (
-                          row["killed"]
-                          < previous["killed"]
-                          or row["injured"]
-                          < previous["injured"]
+                          row["killed"] < prev["killed"]
+                          or row["injured"] < prev["injured"]
                       ):
                           print(
                               "DECREASING POINT OMITTED",
+                              row,
+                          )
+                          continue
+
+                      # Reject impossible jumps likely caused by a bad match.
+                      delta_days = max(
+                          1,
+                          (
+                              datetime.fromisoformat(row["date"]).date()
+                              - datetime.fromisoformat(prev["date"]).date()
+                          ).days,
+                      )
+
+                      killed_jump = (
+                          row["killed"] - prev["killed"]
+                      )
+                      injured_jump = (
+                          row["injured"] - prev["injured"]
+                      )
+
+                      # These limits are deliberately very generous and only
+                      # catch obvious parser mistakes.
+                      if killed_jump / delta_days > 5000:
+                          print(
+                              "IMPOSSIBLE KILLED JUMP OMITTED",
+                              row,
+                          )
+                          continue
+
+                      if injured_jump / delta_days > 15000:
+                          print(
+                              "IMPOSSIBLE INJURED JUMP OMITTED",
                               row,
                           )
                           continue
@@ -490,11 +615,10 @@ jobs:
 
               if not records:
                   raise RuntimeError(
-                      "No Gaza casualty totals were parsed "
-                      "from OCHA."
+                      "No reliable OCHA Gaza casualty points "
+                      "were extracted."
                   )
 
-              # Strip parser internals from the public site data.
               public = [
                   {
                       "date": row["date"],
@@ -505,13 +629,24 @@ jobs:
                       "parser_version": VERSION,
                   }
                   for row in records
+                  if row["date"] >= "2023-10-08"
               ]
+
+              if not public:
+                  raise RuntimeError(
+                      "No records remained after validation."
+                  )
 
               payload = {
                   "source": (
                       "UN OCHA oPt Gaza updates; Palestinian "
                       "casualty totals attributed by OCHA to "
                       "the Gaza Ministry of Health."
+                  ),
+                  "method": (
+                      "Context-based extraction of cumulative killed/"
+                      "injured pairs near Gaza/MoH casualty language, "
+                      "with ambiguity, monotonicity, and jump checks."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
@@ -532,7 +667,7 @@ jobs:
               print(
                   "SUCCESS",
                   len(public),
-                  "records",
+                  "records from",
                   public[0]["date"],
                   "through",
                   public[-1]["date"],
