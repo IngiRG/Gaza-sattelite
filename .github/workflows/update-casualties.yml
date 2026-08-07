@@ -23,7 +23,7 @@ jobs:
       - name: Install updater
         run: pip install requests beautifulsoup4
 
-      - name: Extract exact OCHA killed and injured sentences
+      - name: Extract Gaza casualty totals from OCHA
         shell: bash
         run: |
           cat > /tmp/update_casualties.py <<'PY'
@@ -32,19 +32,17 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor, as_completed
           import json
           import re
-          import time
 
           import requests
           from bs4 import BeautifulSoup
 
-          OUT = Path("data/casualty-timeline.json")
           BASE = "https://www.ochaopt.org/content/"
-          VERSION = 4
-          START = date(2023, 10, 8)
+          OUT = Path("data/casualty-timeline.json")
+          VERSION = 5
 
           session = requests.Session()
           session.headers.update({
-              "User-Agent": "DestructionVisualized-CasualtyTimeline/4.0",
+              "User-Agent": "DestructionVisualized-CasualtyTimeline/5.0",
               "Accept-Language": "en",
           })
 
@@ -53,330 +51,284 @@ jobs:
               "August|September|October|November|December"
           )
 
-          NUMBER = r"\d{1,3}(?:,\d{3})+|\d{4,6}"
-
-          KILLED_PATTERNS = [
-              re.compile(
-                  rf"(?P<n>{NUMBER})\s+"
-                  rf"(?:Palestinians?|people|persons|individuals|civilians)?"
-                  rf"\s*(?:have\s+been|were|are|reportedly|reported\s+as)?"
-                  rf"\s*killed\b",
-                  re.I,
-              ),
-              re.compile(
-                  rf"\b(?:killed|fatalities)\b"
-                  rf"[^\d]{{0,45}}(?P<n>{NUMBER})",
-                  re.I,
-              ),
-          ]
-
-          INJURED_PATTERNS = [
-              re.compile(
-                  rf"(?P<n>{NUMBER})\s+"
-                  rf"(?:Palestinians?|people|persons|individuals|civilians)?"
-                  rf"\s*(?:have\s+been|were|are|reportedly|reported\s+as)?"
-                  rf"\s*injured\b",
-                  re.I,
-              ),
-              re.compile(
-                  rf"\b(?:injured|injuries)\b"
-                  rf"[^\d]{{0,45}}(?P<n>{NUMBER})",
-                  re.I,
-              ),
-          ]
-
-          DATE_RE = re.compile(
-              rf"\b(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})\b",
-              re.I,
-          )
-
-          def parse_number(raw):
-              return int(raw.replace(",", ""))
+          N = r"\d{1,3}(?:,\d{3})+|\d{3,6}"
 
           def clean(text):
               return re.sub(r"\s+", " ", text or "").strip()
 
-          def page_text(url):
+          def number(raw):
+              return int(raw.replace(",", ""))
+
+          def fetch(url):
               try:
                   r = session.get(url, timeout=25)
-
                   if r.status_code == 404:
                       return None
-
                   r.raise_for_status()
 
                   soup = BeautifulSoup(r.text, "html.parser")
 
                   for tag in soup([
-                      "script",
-                      "style",
-                      "nav",
-                      "header",
-                      "footer",
-                      "form",
+                      "script", "style", "nav", "header",
+                      "footer", "form"
                   ]):
                       tag.decompose()
 
-                  return clean(
+                  title = clean(
+                      soup.title.get_text(" ", strip=True)
+                      if soup.title else ""
+                  )
+
+                  text = clean(
                       soup.get_text(" ", strip=True)
                   )
+
+                  return title, text
 
               except Exception as error:
                   print("FETCH FAILED", url, error)
                   return None
 
-          def candidate_chunks(text):
-              # OCHA frequently puts the cumulative casualty statement in one
-              # long sentence. Split only at strong sentence boundaries.
-              parts = re.split(
-                  r"(?<=[.!?])\s+(?=[A-Z])",
-                  text,
-              )
-
-              output = []
-
-              for part in parts:
-                  part = clean(part)
-
-                  if not (
-                      40 <= len(part) <= 1800
-                  ):
-                      continue
-
-                  low = part.lower()
-
-                  # HARD FILTERS. If any of these are absent, the sentence is
-                  # not allowed into the dataset.
-                  if "7 october 2023" not in low:
-                      continue
-
-                  if (
-                      "killed" not in low
-                      and "fatalit" not in low
-                  ):
-                      continue
-
-                  if (
-                      "injured" not in low
-                      and "injur" not in low
-                  ):
-                      continue
-
-                  if not any(
-                      term in low
-                      for term in (
-                          "gaza",
-                          "ministry of health",
-                          "moh",
-                      )
-                  ):
-                      continue
-
-                  output.append(part)
-
-              return output
-
-          def extract_metric(chunk, patterns):
-              values = []
-
-              for pattern in patterns:
-                  for match in pattern.finditer(chunk):
-                      value = parse_number(
-                          match.group("n")
-                      )
-                      values.append(value)
-
-              if not values:
+          def parse_date_word(raw):
+              try:
+                  return datetime.strptime(
+                      clean(raw),
+                      "%d %B %Y",
+                  ).date().isoformat()
+              except Exception:
                   return None
 
-              # The same sentence can also mention subgroup casualties.
-              # The cumulative Gaza-wide total is the largest matching value.
-              return max(values)
-
-          def extract_effective_date(chunk, page_url):
-              # Prefer wording like:
-              # "Between 7 October 2023 and 25 June 2025..."
-              between = re.search(
-                  rf"Between\s+7\s+October\s+2023\s+and\s+"
-                  rf"(?:\d{{1,2}}:\d{{2}}\s+(?:hours?\s+)?(?:on\s+)?)?"
-                  rf"(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})",
-                  chunk,
-                  re.I,
-              )
-
-              if between:
-                  raw = between.group(1)
-
-                  try:
-                      return datetime.strptime(
-                          raw,
-                          "%d %B %Y",
-                      ).date().isoformat()
-                  except Exception:
-                      pass
-
-              # Also accept:
-              # "since 7 October 2023 ... as of 25 June 2025"
-              asof = re.search(
-                  rf"(?:as\s+of|up\s+to|through)\s+"
-                  rf"(?:\d{{1,2}}:\d{{2}}\s+(?:hours?\s+)?(?:on\s+)?)?"
-                  rf"(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})",
-                  chunk,
-                  re.I,
-              )
-
-              if asof:
-                  try:
-                      return datetime.strptime(
-                          asof.group(1),
-                          "%d %B %Y",
-                      ).date().isoformat()
-                  except Exception:
-                      pass
-
-              # Last resort: if the sentence contains exactly two dates and
-              # one is 7 October 2023, the other is the effective date.
-              dates = []
-
-              for match in DATE_RE.finditer(chunk):
-                  try:
-                      parsed = datetime.strptime(
-                          match.group(1),
-                          "%d %B %Y",
-                      ).date()
-                  except Exception:
-                      continue
-
-                  dates.append(parsed)
-
-              unique = sorted(set(dates))
-
-              other = [
-                  d
-                  for d in unique
-                  if d != date(2023, 10, 7)
+          def page_date(title, text):
+              # OCHA pages normally expose publication date near the title.
+              patterns = [
+                  rf"\b(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})\b",
+                  rf"\b(\d{{1,2}}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+20\d{{2}})\b",
               ]
 
-              if len(other) == 1:
-                  return other[0].isoformat()
+              for haystack in (title, text[:1400]):
+                  for pattern in patterns:
+                      m = re.search(pattern, haystack, re.I)
+                      if not m:
+                          continue
+
+                      raw = clean(m.group(1))
+
+                      for fmt in ("%d %B %Y", "%d %b %Y"):
+                          try:
+                              return datetime.strptime(
+                                  raw, fmt
+                              ).date().isoformat()
+                          except Exception:
+                              pass
 
               return None
 
-          def parse_url(url, label):
-              text = page_text(url)
+          # FORMAT 1 — used extensively in 2024 / early 2025:
+          #
+          # Between 7 October 2023 and 30 December 2024,
+          # at least 45,541 Palestinians were killed and
+          # 108,338 were injured, according to MoH in Gaza.
+          BETWEEN = re.compile(
+              rf"Between\s+7\s+October\s+2023\s+and\s+"
+              rf"(?P<date>\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})"
+              rf"(?P<body>.{{0,500}}?)"
+              rf"(?P<k>{N})\s+Palestinians?\s+were\s+killed"
+              rf"(?P<middle>.{{0,180}}?)"
+              rf"(?P<i>{N})\s+(?:Palestinians?\s+)?were\s+injured"
+              rf"(?P<tail>.{{0,180}}?(?:MoH|Ministry\s+of\s+Health).{{0,80}}?Gaza|"
+              rf".{{0,180}}?according\s+to\s+(?:MoH|Ministry\s+of\s+Health).{{0,80}}?)",
+              re.I | re.S,
+          )
 
-              if not text:
+          # FORMAT 2 — later OCHA updates:
+          #
+          # This brings the casualty toll among Palestinians since
+          # 7 October 2023, as reported by MoH, to
+          # 64,656 fatalities and 163,503 injuries.
+          TOLL = re.compile(
+              rf"(?:brings?|bringing)\s+the\s+casualty\s+toll"
+              rf".{{0,180}}?Palestinians?"
+              rf".{{0,180}}?since\s+7\s+October\s+2023"
+              rf".{{0,220}}?(?:MoH|Ministry\s+of\s+Health)"
+              rf".{{0,180}}?(?P<k>{N})\s+fatalit(?:y|ies)"
+              rf".{{0,120}}?(?P<i>{N})\s+injur(?:y|ies)",
+              re.I | re.S,
+          )
+
+          # FORMAT 3 — early October 2023:
+          #
+          # As of 20:00, according to the Ministry of Health in Gaza,
+          # at least 413 Palestinians have been killed and 2,300 others injured.
+          EARLY_ASOF = re.compile(
+              rf"As\s+of\s+\d{{1,2}}:\d{{2}}"
+              rf".{{0,140}}?(?:MoH|Ministry\s+of\s+Health)"
+              rf".{{0,80}}?Gaza"
+              rf".{{0,160}}?(?P<k>{N})\s+Palestinians?"
+              rf"\s+(?:have\s+been|were)\s+killed"
+              rf".{{0,140}}?(?P<i>{N})\s+(?:others?\s+)?injured",
+              re.I | re.S,
+          )
+
+          # FORMAT 4 — early Flash Updates:
+          #
+          # Since the start of hostilities, 2,808 Palestinians have been
+          # killed and 10,850 have been injured.
+          EARLY_SINCE = re.compile(
+              rf"Since\s+the\s+start\s+of\s+(?:the\s+)?hostilities"
+              rf".{{0,100}}?(?P<k>{N})\s+Palestinians?"
+              rf"\s+(?:have\s+been|were)\s+killed"
+              rf".{{0,120}}?(?P<i>{N})\s+(?:Palestinians?\s+)?"
+              rf"(?:have\s+been|were)?\s*injured",
+              re.I | re.S,
+          )
+
+          def valid(killed, injured):
+              return (
+                  100 <= killed <= 500000
+                  and 100 <= injured <= 1000000
+                  and injured > killed
+              )
+
+          def parse_page(url, label, early=False):
+              result = fetch(url)
+
+              if not result:
                   return None
 
-              accepted = []
+              title, text = result
+              matches = []
 
-              for chunk in candidate_chunks(text):
-                  killed = extract_metric(
-                      chunk,
-                      KILLED_PATTERNS,
-                  )
-                  injured = extract_metric(
-                      chunk,
-                      INJURED_PATTERNS,
-                  )
-                  effective = extract_effective_date(
-                      chunk,
-                      url,
+              # Format 1 gives its own effective date.
+              for m in BETWEEN.finditer(text):
+                  killed = number(m.group("k"))
+                  injured = number(m.group("i"))
+                  effective = parse_date_word(
+                      m.group("date")
                   )
 
-                  if (
-                      killed is None
-                      or injured is None
-                      or effective is None
+                  if effective and valid(killed, injured):
+                      matches.append((
+                          effective,
+                          killed,
+                          injured,
+                          "between-7-oct",
+                      ))
+
+              # Format 2 uses the OCHA page/update date.
+              for m in TOLL.finditer(text):
+                  killed = number(m.group("k"))
+                  injured = number(m.group("i"))
+                  effective = page_date(
+                      title,
+                      text,
+                  )
+
+                  if effective and valid(killed, injured):
+                      matches.append((
+                          effective,
+                          killed,
+                          injured,
+                          "casualty-toll",
+                      ))
+
+              # Early formats are ONLY allowed on the known Gaza Flash
+              # Update URL families. This prevents accidental use of Israeli
+              # or West Bank casualty sentences elsewhere on the site.
+              if early:
+                  effective = page_date(
+                      title,
+                      text,
+                  )
+
+                  for regex, method in (
+                      (EARLY_ASOF, "early-as-of"),
+                      (EARLY_SINCE, "early-since"),
                   ):
-                      continue
+                      for m in regex.finditer(text):
+                          killed = number(m.group("k"))
+                          injured = number(m.group("i"))
 
-                  # Sanity checks reject parser mistakes only.
-                  if not (100 <= killed <= 500000):
-                      continue
+                          if (
+                              effective
+                              and effective >= "2023-10-08"
+                              and valid(killed, injured)
+                          ):
+                              matches.append((
+                                  effective,
+                                  killed,
+                                  injured,
+                                  method,
+                              ))
 
-                  if not (100 <= injured <= 1000000):
-                      continue
-
-                  if injured <= killed:
-                      continue
-
-                  if effective < "2023-10-08":
-                      continue
-
-                  if effective > date.today().isoformat():
-                      continue
-
-                  accepted.append({
-                      "date": effective,
-                      "killed": killed,
-                      "injured": injured,
-                      "source_url": url,
-                      "series_label": label,
-                      "source_sentence": chunk,
-                      "parser_version": VERSION,
-                  })
-
-              if not accepted:
+              if not matches:
                   return None
 
-              # One page may repeat the exact same sentence in mobile/desktop
-              # markup. Collapse identical results.
               unique = {
-                  (
-                      row["date"],
-                      row["killed"],
-                      row["injured"],
-                  ): row
-                  for row in accepted
+                  (d, k, i): method
+                  for d, k, i, method in matches
               }
 
-              # If a page yields two different cumulative pairs, reject the
-              # whole page rather than guessing.
+              # Different totals on the same page = don't guess.
               if len(unique) != 1:
                   print(
-                      "AMBIGUOUS PAGE",
+                      "AMBIGUOUS PAGE OMITTED",
                       url,
                       list(unique),
                   )
                   return None
 
-              return next(iter(unique.values()))
+              (effective, killed, injured), method = next(
+                  iter(unique.items())
+              )
 
-          def urls_to_scan():
-              urls = []
+              if effective > date.today().isoformat():
+                  return None
 
-              # Early OCHA series, beginning October 2023.
-              for number in range(1, 190):
-                  urls.append((
+              return {
+                  "date": effective,
+                  "killed": killed,
+                  "injured": injured,
+                  "source_url": url,
+                  "series_label": label,
+                  "parse_method": method,
+                  "parser_version": VERSION,
+              }
+
+          def targets():
+              rows = []
+
+              # The first reports used "Escalation..." in the URL.
+              for n in range(1, 30):
+                  rows.append((
+                      BASE
+                      + "escalation-gaza-strip-and-israel-flash-update-"
+                      + str(n),
+                      f"Flash Update #{n}",
+                      True,
+                  ))
+
+              # The longer-running early series used "Hostilities...".
+              for n in range(1, 190):
+                  rows.append((
                       BASE
                       + "hostilities-gaza-strip-and-israel-flash-update-"
-                      + str(number),
-                      f"Flash Update #{number}",
+                      + str(n),
+                      f"Flash Update #{n}",
+                      True,
                   ))
 
-              # Later numbered Gaza situation updates.
-              for number in range(150, 451):
-                  urls.append((
+              # Later Gaza Humanitarian Situation Updates.
+              for n in range(150, 451):
+                  rows.append((
                       BASE
                       + "humanitarian-situation-update-"
-                      + str(number)
+                      + str(n)
                       + "-gaza-strip",
-                      f"Situation Update #{number}",
+                      f"Situation Update #{n}",
+                      False,
                   ))
 
-              # Some later Gaza response reports use this numbering.
-              for number in range(1, 121):
-                  urls.append((
-                      BASE
-                      + "gaza-humanitarian-response-situation-report-no-"
-                      + str(number),
-                      f"Gaza Humanitarian Response Report #{number}",
-                  ))
-
-              # Current OCHA reports use dates in the URL rather than a report
-              # number. Probe every date from October 2025 through today;
-              # nonexistent dates simply return 404.
+              # Some newer OCHA pages use date-based Situation Report URLs.
               current = date(2025, 10, 1)
               today = date.today()
 
@@ -387,53 +339,52 @@ jobs:
                       f"{current.year}"
                   )
 
-                  urls.append((
+                  rows.append((
                       BASE
                       + "humanitarian-situation-report-"
                       + slug,
                       "Humanitarian Situation Report",
+                      False,
                   ))
 
                   current += timedelta(days=1)
 
-              return urls
+              return rows
 
-          def discover_records():
-              targets = urls_to_scan()
+          def collect():
+              todo = targets()
               print(
-                  "Scanning",
-                  len(targets),
-                  "possible OCHA pages",
+                  "Checking",
+                  len(todo),
+                  "possible OCHA URLs",
               )
 
               records = []
 
-              # Concurrency makes the many harmless 404 checks fast while
-              # staying modest enough not to hammer OCHA.
               with ThreadPoolExecutor(
                   max_workers=6
               ) as executor:
                   futures = {
                       executor.submit(
-                          parse_url,
+                          parse_page,
                           url,
                           label,
-                      ): (url, label)
-                      for url, label in targets
+                          early,
+                      ): url
+                      for url, label, early in todo
                   }
 
-                  completed = 0
+                  done = 0
 
                   for future in as_completed(futures):
-                      completed += 1
+                      done += 1
 
                       try:
                           row = future.result()
                       except Exception as error:
-                          url, _ = futures[future]
                           print(
                               "PARSE FAILED",
-                              url,
+                              futures[future],
                               error,
                           )
                           row = None
@@ -444,34 +395,33 @@ jobs:
                               row["date"],
                               row["killed"],
                               row["injured"],
-                              row["series_label"],
+                              row["parse_method"],
                           )
                           records.append(row)
 
-                      if completed % 100 == 0:
+                      if done % 100 == 0:
                           print(
                               "Checked",
-                              completed,
+                              done,
                               "/",
-                              len(targets),
+                              len(todo),
                           )
 
               return records
 
           def reconcile(records):
-              # Group by effective casualty date.
-              by_date = {}
+              grouped = {}
 
               for row in records:
-                  by_date.setdefault(
+                  grouped.setdefault(
                       row["date"],
                       [],
                   ).append(row)
 
-              final = []
+              output = []
 
-              for effective in sorted(by_date):
-                  rows = by_date[effective]
+              for effective in sorted(grouped):
+                  rows = grouped[effective]
 
                   pairs = {
                       (
@@ -481,33 +431,36 @@ jobs:
                       for row in rows
                   }
 
-                  # Multiple OCHA pages agreeing on the same figures are fine.
-                  # Disagreement means the date is omitted.
                   if len(pairs) != 1:
                       print(
-                          "DATE CONFLICT OMITTED",
+                          "CONFLICTING DATE OMITTED",
                           effective,
                           pairs,
                       )
                       continue
 
-                  # Prefer a Situation Update URL where possible.
+                  # Prefer later structured OCHA update series over duplicate
+                  # Flash Update pages carrying the same totals.
                   rows.sort(
                       key=lambda row: (
                           "Situation Update"
+                          not in row["series_label"]
+                          and "Humanitarian Situation Report"
                           not in row["series_label"],
                           row["source_url"],
                       )
                   )
 
-                  final.append(rows[0])
+                  output.append(rows[0])
 
-              # Cumulative series validation.
-              cleaned = []
+              # Cumulative totals can be revised, but a parser-generated
+              # backwards jump is much more likely to be wrong. Omit it rather
+              # than modifying OCHA's source number.
+              final = []
 
-              for row in final:
-                  if cleaned:
-                      previous = cleaned[-1]
+              for row in output:
+                  if final:
+                      previous = final[-1]
 
                       if (
                           row["killed"]
@@ -516,14 +469,14 @@ jobs:
                           < previous["injured"]
                       ):
                           print(
-                              "DECREASING TOTAL OMITTED",
+                              "DECREASING POINT OMITTED",
                               row,
                           )
                           continue
 
-                  cleaned.append(row)
+                  final.append(row)
 
-              return cleaned
+              return final
 
           def main():
               OUT.parent.mkdir(
@@ -532,45 +485,33 @@ jobs:
               )
 
               records = reconcile(
-                  discover_records()
+                  collect()
               )
 
               if not records:
                   raise RuntimeError(
-                      "No exact OCHA cumulative killed/injured "
-                      "sentences were found."
+                      "No Gaza casualty totals were parsed "
+                      "from OCHA."
                   )
 
-              # Do not store full copied OCHA prose in the public JSON.
-              # It is useful during validation, but the published file needs
-              # only the numbers/date/source.
-              public = []
-
-              for row in records:
-                  public.append({
+              # Strip parser internals from the public site data.
+              public = [
+                  {
                       "date": row["date"],
                       "killed": row["killed"],
                       "injured": row["injured"],
                       "source_url": row["source_url"],
                       "series_label": row["series_label"],
                       "parser_version": VERSION,
-                  })
+                  }
+                  for row in records
+              ]
 
               payload = {
                   "source": (
-                      "UN OCHA oPt pages citing cumulative "
-                      "Gaza casualty figures"
-                  ),
-                  "attribution": (
-                      "Casualty totals are reported figures; "
-                      "OCHA commonly attributes Palestinian "
-                      "Gaza totals to the Gaza Ministry of Health."
-                  ),
-                  "method": (
-                      "A record is accepted only when killed and "
-                      "injured cumulative totals occur in the same "
-                      "OCHA sentence and that sentence anchors the "
-                      "figures to 7 October 2023."
+                      "UN OCHA oPt Gaza updates; Palestinian "
+                      "casualty totals attributed by OCHA to "
+                      "the Gaza Ministry of Health."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
@@ -589,11 +530,11 @@ jobs:
               )
 
               print(
-                  "SUCCESS:",
+                  "SUCCESS",
                   len(public),
-                  "records from",
+                  "records",
                   public[0]["date"],
-                  "to",
+                  "through",
                   public[-1]["date"],
               )
 
