@@ -42,7 +42,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 12
+          VERSION = 13
 
           ARCHIVES = [
               "https://www.emro.who.int/opt/information-resources/emergency-situation-reports.html",
@@ -449,14 +449,14 @@ jobs:
                   and injured > killed
               )
 
-          def exact_label_values(text, label_regex):
-              """
-              Find a number attached to an exact semantic label without
-              assuming whether pdftotext placed the number before or after it.
+          def normalize_views(texts):
+              return [
+                  (mode, clean(content))
+                  for mode, content in texts
+                  if clean(content)
+              ]
 
-              We only look within 180 characters of the exact Gaza label.
-              """
-              flat = clean(text)
+          def extract_number_near_label(flat, label_regex, radius=120):
               values = set()
 
               for label in re.finditer(
@@ -465,247 +465,178 @@ jobs:
                   re.I,
               ):
                   left = flat[
-                      max(0, label.start() - 180):
+                      max(0, label.start() - radius):
                       label.start()
                   ]
                   right = flat[
                       label.end():
-                      min(len(flat), label.end() + 180)
+                      min(len(flat), label.end() + radius)
                   ]
 
-                  left_nums = list(
-                      re.finditer(NUM, left)
-                  )
-                  right_nums = list(
-                      re.finditer(NUM, right)
-                  )
-
-                  candidates = []
+                  left_nums = list(re.finditer(NUM, left))
+                  right_nums = list(re.finditer(NUM, right))
 
                   if left_nums:
                       m = left_nums[-1]
-                      candidates.append(
-                          (
-                              len(left) - m.end(),
-                              n(m.group(0)),
-                          )
-                      )
+                      if len(left) - m.end() <= 70:
+                          values.add(n(m.group(0)))
 
                   if right_nums:
                       m = right_nums[0]
-                      candidates.append(
-                          (
-                              m.start(),
-                              n(m.group(0)),
-                          )
-                      )
-
-                  for distance, value in candidates:
-                      if distance <= 90:
-                          values.add(value)
+                      if m.start() <= 70:
+                          values.add(n(m.group(0)))
 
               return values
 
-          def pairs_from_early_gaza_labels(text):
-              """
-              Early WHO cards explicitly label Gaza figures. We use those
-              exact labels and tolerate pdftotext putting the value on either
-              side of the phrase.
-              """
+          def layout_early_explicit(flat):
               killed = set()
               injured = set()
 
-              killed_labels = [
+              for label in (
                   r"(?:Estimated\s+number\s+of\s+)?"
                   r"Palestinians?\s+killed\s+in\s+Gaza",
                   r"(?:Estimated\s+number\s+of\s+)?"
                   r"people\s+killed\s+in\s+Gaza",
-              ]
+                  r"Number\s+of\s+people\s+killed\s+in\s+Gaza",
+              ):
+                  killed.update(
+                      extract_number_near_label(flat, label)
+                  )
 
-              injured_labels = [
+              for label in (
                   r"(?:Estimated\s+number\s+of\s+)?"
                   r"Palestinians?\s+injured\s+in\s+Gaza",
                   r"(?:Estimated\s+number\s+of\s+)?"
                   r"people\s+injured\s+in\s+Gaza",
-              ]
-
-              for label in killed_labels:
-                  killed.update(
-                      exact_label_values(
-                          text,
-                          label,
-                      )
-                  )
-
-              for label in injured_labels:
+                  r"Number\s+of\s+people\s+injured\s+in\s+Gaza",
+              ):
                   injured.update(
-                      exact_label_values(
-                          text,
-                          label,
-                      )
+                      extract_number_near_label(flat, label)
                   )
 
               return [
-                  (k, i, "explicit-gaza-labels")
+                  (k, i, "layout-early-explicit")
                   for k in killed
                   for i in injured
                   if valid(k, i)
               ]
 
-          def pairs_from_overview(text):
-              """
-              Later WHO format:
-
-              Gaza Strip
-              Overview
-              Source: Ministry of Health.
-              41,272 Fatalities
-              95,551 Injuries
-
-              Only inspect the first-page Gaza overview BEFORE
-              'Health Facility' / 'Health Care' so health-attack casualty
-              counts cannot be selected accidentally.
-              """
-              flat = clean(text)
+          def gaza_overview_block(flat):
               low = flat.lower()
+              gaza = low.find("gaza strip")
+              if gaza < 0:
+                  return None
 
-              gaza_pos = low.find("gaza strip")
-              if gaza_pos < 0:
-                  return []
-
-              source_pos = low.find(
+              source = low.find(
                   "source: ministry of health",
-                  gaza_pos,
+                  gaza,
               )
-
-              if source_pos < 0:
-                  source_pos = low.find(
-                      "source: ministry of health.",
-                      gaza_pos,
+              if source < 0:
+                  source = low.find(
+                      "source ministry of health",
+                      gaza,
                   )
+              if source < 0:
+                  return None
 
-              if source_pos < 0:
-                  return []
-
-              end_positions = []
-
+              stops = []
               for marker in (
                   "health facility",
                   "health care functioning",
                   "healthcare functioning",
                   "health attacks",
+                  "hospital functionality",
                   "hospitals functionality",
-                  "phccs functionality",
+                  "phcc",
               ):
-                  pos = low.find(
-                      marker,
-                      source_pos + 20,
-                  )
-                  if pos > source_pos:
-                      end_positions.append(pos)
+                  pos = low.find(marker, source + 10)
+                  if pos > source:
+                      stops.append(pos)
 
-              end = (
-                  min(end_positions)
-                  if end_positions
-                  else min(
-                      len(flat),
-                      source_pos + 2200,
-                  )
-              )
+              end = min(stops) if stops else min(len(flat), source + 2400)
+              return flat[gaza:end]
 
-              overview = flat[
-                  gaza_pos:end
-              ]
+          def layout_overview_cards(flat):
+              block = gaza_overview_block(flat)
+              if not block:
+                  return []
 
               killed = set()
               injured = set()
 
-              for m in re.finditer(
-                  rf"(?P<n>{NUM})\s+"
-                  rf"(?:Reported\s+)?Fatalit(?:y|ies)\b",
-                  overview,
-                  re.I,
+              for pattern in (
+                  rf"(?P<n>{NUM})\s+(?:Reported\s+)?Fatalit(?:y|ies)\b",
+                  rf"\bFatalit(?:y|ies)\b[^\d]{{0,50}}(?P<n>{NUM})",
               ):
-                  killed.add(
-                      n(m.group("n"))
-                  )
+                  for m in re.finditer(pattern, block, re.I):
+                      killed.add(n(m.group("n")))
 
-              for m in re.finditer(
-                  rf"(?P<n>{NUM})\s+"
-                  rf"(?:Reported\s+)?Injur(?:y|ies)\b",
-                  overview,
-                  re.I,
+              for pattern in (
+                  rf"(?P<n>{NUM})\s+(?:Reported\s+)?Injur(?:y|ies)\b",
+                  rf"\bInjur(?:y|ies)\b[^\d]{{0,50}}(?P<n>{NUM})",
               ):
-                  injured.add(
-                      n(m.group("n"))
-                  )
-
-              # Some layouts put labels before values after text extraction.
-              if not killed:
-                  for m in re.finditer(
-                      rf"\bFatalit(?:y|ies)\b"
-                      rf"[^\d]{{0,40}}(?P<n>{NUM})",
-                      overview,
-                      re.I,
-                  ):
-                      killed.add(
-                          n(m.group("n"))
-                      )
-
-              if not injured:
-                  for m in re.finditer(
-                      rf"\bInjur(?:y|ies)\b"
-                      rf"[^\d]{{0,40}}(?P<n>{NUM})",
-                      overview,
-                      re.I,
-                  ):
-                      injured.add(
-                          n(m.group("n"))
-                      )
+                  for m in re.finditer(pattern, block, re.I):
+                      injured.add(n(m.group("n")))
 
               return [
-                  (k, i, "gaza-overview-moh")
+                  (k, i, "layout-overview-cards")
                   for k in killed
                   for i in injured
                   if valid(k, i)
               ]
 
-          def pairs_from_cumulative_sentence(text):
-              """
-              Backup for recent issues if WHO changes the cards but writes an
-              explicit cumulative Gaza sentence on page 1.
-              """
-              flat = clean(text)
+          def layout_cumulative_sentence(flat):
               patterns = [
                   re.compile(
                       rf"(?:cumulative\s+toll|cumulatively)"
-                      rf".{{0,140}}?(?:since\s+October\s+2023|"
+                      rf".{{0,180}}?(?:since\s+October\s+2023|"
                       rf"since\s+7\s+October\s+2023)"
-                      rf".{{0,160}}?(?P<k>{NUM})\s+"
+                      rf".{{0,200}}?(?P<k>{NUM})\s+"
                       rf"(?:deaths|fatalities|people\s+(?:have\s+been\s+)?killed)"
-                      rf".{{0,180}}?(?P<i>{NUM})\s+"
+                      rf".{{0,220}}?(?P<i>{NUM})\s+"
                       rf"(?:injuries|people\s+injured|injured)",
+                      re.I | re.S,
+                  ),
+                  re.compile(
+                      rf"(?:brings?|bringing)\s+the\s+cumulative\s+toll"
+                      rf".{{0,180}}?since\s+(?:7\s+)?October\s+2023"
+                      rf".{{0,180}}?(?P<k>{NUM})\s+"
+                      rf"(?:deaths|fatalities)"
+                      rf".{{0,180}}?(?P<i>{NUM})\s+"
+                      rf"(?:injuries|injured)",
                       re.I | re.S,
                   ),
               ]
 
-              output = []
-
+              out = []
               for pattern in patterns:
                   for m in pattern.finditer(flat):
-                      killed = n(m.group("k"))
-                      injured = n(m.group("i"))
+                      k = n(m.group("k"))
+                      i = n(m.group("i"))
+                      if valid(k, i):
+                          out.append((k, i, "layout-cumulative-sentence"))
+              return out
 
-                      if valid(killed, injured):
-                          output.append(
-                              (
-                                  killed,
-                                  injured,
-                                  "explicit-cumulative-sentence",
-                              )
-                          )
+          def parse_known_layouts(texts):
+              """
+              Accept only one of three known WHO structures:
+              1) early explicit Gaza killed/injured labels
+              2) Gaza Strip Overview + Source: Ministry of Health + Fatalities/Injuries
+              3) explicit cumulative-since-Oct-2023 sentence
+              """
+              all_pairs = {}
 
-              return output
+              for mode, flat in normalize_views(texts):
+                  candidates = []
+                  candidates.extend(layout_early_explicit(flat))
+                  candidates.extend(layout_overview_cards(flat))
+                  candidates.extend(layout_cumulative_sentence(flat))
+
+                  for k, i, method in candidates:
+                      all_pairs.setdefault((k, i), set()).add(f"{method}:{mode}")
+
+              return all_pairs
+
 
           def parse_issue(meta):
               try:
@@ -762,7 +693,7 @@ jobs:
                   )
                   return None
 
-              all_pairs = {}
+              usable_texts = []
 
               for mode, content in texts:
                   issue_match = PDF_ISSUE.search(
@@ -784,30 +715,13 @@ jobs:
                           )
                           continue
 
-                  candidates = []
-                  candidates.extend(
-                      pairs_from_early_gaza_labels(
-                          content
-                      )
-                  )
-                  candidates.extend(
-                      pairs_from_overview(
-                          content
-                      )
-                  )
-                  candidates.extend(
-                      pairs_from_cumulative_sentence(
-                          content
-                      )
+                  usable_texts.append(
+                      (mode, content)
                   )
 
-                  for killed, injured, method in candidates:
-                      all_pairs.setdefault(
-                          (killed, injured),
-                          set(),
-                      ).add(
-                          f"{method}:{mode}"
-                      )
+              all_pairs = parse_known_layouts(
+                  usable_texts
+              )
 
               if not all_pairs:
                   print(
@@ -914,7 +828,7 @@ jobs:
 
               # Safety gate. WHO currently has far more than 19 Gaza issues.
               # If parsing suddenly collapses, do NOT overwrite good data.
-              if len(rows) < 30:
+              if len(rows) < 35:
                   missing = sorted(
                       set(meta["issue"] for meta in metas)
                       - set(row["issue"] for row in rows)
@@ -952,10 +866,13 @@ jobs:
                   ),
                   "method": (
                       "Issue number and date come from WHO's official report "
-                      "archive. Casualty totals come only from first-page "
-                      "Gaza-specific labels or the Gaza Overview block marked "
-                      "'Source: Ministry of Health'. No OCR, interpolation, "
-                      "nearest-number matching, or inferred totals."
+                      "archive. Page 1 is parsed in both layout and raw text "
+                      "modes. A report is accepted only if it matches one of "
+                      "three known WHO structures: explicit Gaza killed/injured "
+                      "labels; the Gaza Strip Overview block marked 'Source: "
+                      "Ministry of Health' with Fatalities/Injuries; or an "
+                      "explicit cumulative-since-October-2023 sentence. No OCR, "
+                      "interpolation, nearest-number matching, or inferred totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
