@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install tile generator
-        run: pip install requests rio-tiler pillow numpy shapely
+        run: pip install requests rio-tiler pillow numpy
       - name: Generate monthly tiles
         shell: bash
         run: |
@@ -29,7 +29,6 @@ jobs:
           import numpy as np
           from PIL import Image
           from rio_tiler.io import COGReader
-          from shapely.geometry import box, shape
 
           SEARCH="https://earth-search.aws.element84.com/v1/search"
           ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
@@ -37,38 +36,6 @@ jobs:
           BBOX=(34.22,31.30,34.60,31.67)
           ZOOMS=range(8,15)
           OUT=Path("tiles")
-          AOI=box(*BBOX)
-
-          # Build one fixed, tile-aligned extent at the highest zoom.
-          # This becomes the visible map footprint at every zoom level.
-          MAX_ZOOM=max(ZOOMS)
-
-          def tile_x(lon,z):
-              return int((lon+180.0)/360.0*(1<<z))
-
-          def tile_y(lat,z):
-              r=math.radians(lat)
-              return int((1.0-math.asinh(math.tan(r))/math.pi)/2.0*(1<<z))
-
-          def tile_lon(x,z):
-              return x/(1<<z)*360.0-180.0
-
-          def tile_lat(y,z):
-              n=math.pi*(1.0-2.0*y/(1<<z))
-              return math.degrees(math.atan(math.sinh(n)))
-
-          west,south,east,north=BBOX
-          sx0=tile_x(west,MAX_ZOOM)
-          sx1=tile_x(east,MAX_ZOOM)
-          sy0=tile_y(north,MAX_ZOOM)
-          sy1=tile_y(south,MAX_ZOOM)
-
-          DISPLAY_BBOX=(
-              tile_lon(sx0,MAX_ZOOM),
-              tile_lat(sy1+1,MAX_ZOOM),
-              tile_lon(sx1+1,MAX_ZOOM),
-              tile_lat(sy0,MAX_ZOOM),
-          )
 
           def get_item(item_id):
               r=requests.get(f"{ITEM}/{item_id}",timeout=90);r.raise_for_status();return r.json()
@@ -83,36 +50,12 @@ jobs:
           def cloud(item): return float(item.get("properties",{}).get("eo:cloud_cover",999))
           def dt(item): return item["properties"].get("datetime") or item["properties"].get("start_datetime")
           def choose_month(items):
-              valid=[
-                  item for item in items
-                  if visual(item) and item.get("geometry")
-              ]
+              valid=[item for item in items if visual(item)]
               if not valid:
                   return None,None
-
               valid.sort(key=lambda item:(cloud(item),dt(item)))
               primary=valid[0]
-
-              try:
-                  primary_geom=shape(primary["geometry"]).intersection(AOI)
-                  missing=AOI.difference(primary_geom)
-              except Exception:
-                  missing=AOI
-
-              backup=None
-              best_added=0.0
-
-              for candidate in valid[1:]:
-                  try:
-                      candidate_geom=shape(candidate["geometry"]).intersection(AOI)
-                      added=candidate_geom.intersection(missing).area
-                  except Exception:
-                      continue
-
-                  if added>best_added:
-                      best_added=added
-                      backup=candidate
-
+              backup=valid[1] if len(valid)>1 else None
               return primary,backup
           def month_keys():
               now=datetime.now(timezone.utc);year,month=2023,10
@@ -124,14 +67,10 @@ jobs:
           def laty(lat,z):
               radians=math.radians(lat);return int((1-math.asinh(math.tan(radians))/math.pi)/2*(1<<z))
           def coords():
-              west,south,east,north=DISPLAY_BBOX
+              west,south,east,north=BBOX
               for z in ZOOMS:
-                  x0=lonx(west,z)
-                  x1=lonx(east,z)
-                  y0=laty(north,z)
-                  y1=laty(south,z)
-                  for x in range(x0,x1+1):
-                      for y in range(y0,y1+1):
+                  for x in range(lonx(west,z),lonx(east,z)+1):
+                      for y in range(laty(north,z),laty(south,z)+1):
                           yield z,x,y
           TILE_COORDS=list(coords())
           def read_tile(reader,x,y,z):
@@ -139,7 +78,8 @@ jobs:
                   return None,None
               try:
                   image=reader.tile(x,y,z,tilesize=256)
-              except Exception:
+              except Exception as error:
+                  print(f"read failed {z}/{x}/{y}: {error}",file=sys.stderr)
                   return None,None
 
               data=np.asarray(image.data)
@@ -156,30 +96,10 @@ jobs:
                   mask=mask[0]
               return data,mask>0
 
-          def bbox_pixel_mask(x,y,z):
-              # Mask each edge tile to the exact BBOX so every zoom level
-              # shows precisely the same geographic extent.
-              size=256
-              world=size*(1<<z)
-
-              pixel_x=x*size+np.arange(size)+0.5
-              pixel_y=y*size+np.arange(size)+0.5
-
-              lon=pixel_x/world*360.0-180.0
-              mercator_y=np.pi*(1.0-2.0*pixel_y/world)
-              lat=np.degrees(np.arctan(np.sinh(mercator_y)))
-
-              west,south,east,north=DISPLAY_BBOX
-              lon_ok=(lon>=west)&(lon<=east)
-              lat_ok=(lat>=south)&(lat<=north)
-
-              return lat_ok[:,None]&lon_ok[None,:]
-
           def render(label,item,backup=None,force=False):
               folder=OUT/label
               if force and folder.exists():
                   shutil.rmtree(folder)
-
               folder.mkdir(parents=True,exist_ok=True)
 
               with COGReader(visual(item)) as primary:
@@ -187,18 +107,21 @@ jobs:
                   try:
                       for number,(z,x,y) in enumerate(TILE_COORDS,1):
                           path=folder/str(z)/str(x)/f"{y}.webp"
+
+                          # Reuse good tiles exactly as before.
                           if path.exists() and path.stat().st_size>100:
                               continue
 
                           rgb=np.zeros((3,256,256),dtype=np.uint8)
                           valid=np.zeros((256,256),dtype=bool)
 
-                          data,mask=read_tile(primary,x,y,z)
-                          if data is not None:
-                              rgb[:,mask]=data[:,mask]
-                              valid|=mask
+                          primary_data,primary_mask=read_tile(primary,x,y,z)
+                          if primary_data is not None:
+                              rgb[:,primary_mask]=primary_data[:,primary_mask]
+                              valid|=primary_mask
 
-                          if not np.all(valid):
+                          # Only fill pixels the primary scene does not provide.
+                          if backup_reader is not None and not np.all(valid):
                               backup_data,backup_mask=read_tile(
                                   backup_reader,x,y,z
                               )
@@ -207,18 +130,18 @@ jobs:
                                   rgb[:,take]=backup_data[:,take]
                                   valid|=take
 
-                          # Pixels outside the configured BBOX are always
-                          # transparent, even when the containing map tile
-                          # extends farther north, south, east or west.
-                          valid &= bbox_pixel_mask(x,y,z)
-
+                          # Always write the tile path. If neither scene has
+                          # coverage, the uncovered pixels remain transparent.
                           rgba=np.zeros((256,256,4),dtype=np.uint8)
                           rgba[:,:,:3]=np.moveaxis(rgb,0,2)
                           rgba[:,:,3]=valid.astype(np.uint8)*255
 
                           path.parent.mkdir(parents=True,exist_ok=True)
                           Image.fromarray(rgba).save(
-                              path,"WEBP",quality=78,method=4
+                              path,
+                              "WEBP",
+                              quality=78,
+                              method=4
                           )
 
                           if number%100==0:
@@ -231,8 +154,8 @@ jobs:
           if manifest_path.exists():
               try:old_manifest=json.loads(manifest_path.read_text())
               except Exception:old_manifest={}
-          before=get_item(BEFORE_ID);render("before",before,None,force=(old_manifest.get("bbox_mode")!="fixed_extent" or old_manifest.get("before",{}).get("id")!=before["id"]))
-          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox_mode":"fixed_extent","bbox":BBOX,"display_bbox":DISPLAY_BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
+          before=get_item(BEFORE_ID);render("before",before,None,force=old_manifest.get("before",{}).get("id")!=before["id"])
+          manifest={"generated_at":datetime.now(timezone.utc).isoformat(),"bbox":BBOX,"zooms":[min(ZOOMS),max(ZOOMS)],"before":{"id":before["id"],"datetime":dt(before),"cloud":cloud(before),"href":visual(before)},"months":{}}
           for key,year,month in month_keys():
               selected,backup=choose_month(search_month(year,month))
               if selected is None:
@@ -242,7 +165,7 @@ jobs:
                   f"monthly/{key}",
                   selected,
                   backup,
-                  force=(old_manifest.get("bbox_mode")!="fixed_extent" or previous.get("id")!=selected["id"])
+                  force=previous.get("id")!=selected["id"]
               )
               manifest["months"][key]={
                   "id":selected["id"],
