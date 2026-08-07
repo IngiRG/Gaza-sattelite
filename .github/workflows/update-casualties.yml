@@ -1,4 +1,4 @@
-name: Update Gaza casualty timeline
+name: Update Gaza casualty timeline from WHO
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@v4
@@ -20,41 +20,38 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install updater
+      - name: Install parser
         run: |
           sudo apt-get update
           sudo apt-get install -y poppler-utils
           pip install requests beautifulsoup4
 
-      - name: Build weekly Gaza casualty timeline
+      - name: Build casualty timeline from WHO EMRO reports
         shell: bash
         run: |
-          cat > /tmp/update_casualties.py <<'PY'
+          cat > /tmp/update_who.py <<'PY'
           from pathlib import Path
-          from datetime import date, datetime, timedelta, timezone
-          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime, timezone, date
           from urllib.parse import urljoin
-          import calendar
           import json
-          import math
           import re
           import subprocess
           import tempfile
-          import time
 
           import requests
           from bs4 import BeautifulSoup
 
-          BASE = "https://www.ochaopt.org"
-          CONTENT = BASE + "/content/"
-          SNAPSHOTS = BASE + "/page/publications/snapshots"
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 8
-          START_DATE = date(2023, 10, 8)
+          VERSION = 9
+
+          ARCHIVES = [
+              "https://www.emro.who.int/opt/information-resources/emergency-situation-reports.html",
+              "https://www.emro.who.int/fr/opt/information-resources/emergency-situation-reports.html",
+          ]
 
           session = requests.Session()
           session.headers.update({
-              "User-Agent": "DestructionVisualized-CasualtyTimeline/8.0",
+              "User-Agent": "DestructionVisualized-WHO-CasualtyTimeline/9.0",
               "Accept-Language": "en",
           })
 
@@ -62,552 +59,74 @@ jobs:
               "January|February|March|April|May|June|July|"
               "August|September|October|November|December"
           )
-          DATE_WORD = re.compile(
-              rf"\b(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})\b",
-              re.I,
-          )
-          NUMBER = r"\d{1,3}(?:,\d{3})+|\d{3,6}"
 
-          def clean(value):
-              return re.sub(r"\s+", " ", value or "").strip()
+          ISSUE_RE = re.compile(r"\bIssue\s+(\d+)\b", re.I)
 
-          def parse_number(raw):
-              return int(raw.replace(",", "").replace(" ", ""))
+          def clean(text):
+              return re.sub(r"[ \t]+", " ", text or "").strip()
 
-          def parse_date(raw):
-              raw = clean(raw)
-              for fmt in ("%d %B %Y", "%d %b %Y"):
-                  try:
-                      return datetime.strptime(raw, fmt).date()
-                  except Exception:
-                      pass
-              return None
-
-          def request(url, timeout=45):
+          def get(url, timeout=60):
               r = session.get(url, timeout=timeout)
-              if r.status_code == 404:
-                  return None
               r.raise_for_status()
               return r
 
-          def html_page(url):
-              try:
-                  r = request(url)
-                  if r is None:
-                      return None
+          def discover():
+              found = {}
 
-                  soup = BeautifulSoup(r.text, "html.parser")
-                  title = clean(
-                      soup.find("h1").get_text(" ", strip=True)
-                      if soup.find("h1")
-                      else (
-                          soup.title.get_text(" ", strip=True)
-                          if soup.title else ""
+              for archive in ARCHIVES:
+                  try:
+                      soup = BeautifulSoup(
+                          get(archive).text,
+                          "html.parser",
                       )
-                  )
+                  except Exception as error:
+                      print("Archive failed:", archive, error)
+                      continue
 
-                  published = None
-                  for attrs in (
-                      {"property": "article:published_time"},
-                      {"name": "date"},
-                      {"name": "DC.date"},
-                  ):
-                      tag = soup.find("meta", attrs=attrs)
-                      if tag and tag.get("content"):
-                          raw = tag["content"].strip()
-                          try:
-                              published = datetime.fromisoformat(
-                                  raw.replace("Z", "+00:00")
-                              ).date()
-                              break
-                          except Exception:
-                              pass
+                  for a in soup.find_all("a", href=True):
+                      label = clean(a.get_text(" ", strip=True))
+                      href = urljoin(archive, a["href"])
 
-                  if published is None:
-                      # OCHA places the publication date close to the H1.
-                      h1 = soup.find("h1")
-                      vicinity = clean(
-                          h1.parent.get_text(" ", strip=True)
-                          if h1 and h1.parent else
-                          r.text[:2500]
-                      )
-                      for m in DATE_WORD.finditer(vicinity):
-                          d = parse_date(m.group(1))
-                          if d and START_DATE <= d <= date.today():
-                              published = d
-                              break
+                      if ".pdf" not in href.lower():
+                          continue
 
-                  links = [
-                      urljoin(url, a["href"])
-                      for a in soup.find_all("a", href=True)
-                  ]
-
-                  for tag in soup([
-                      "script", "style", "nav", "header",
-                      "footer", "form"
-                  ]):
-                      tag.decompose()
-
-                  text = clean(soup.get_text(" ", strip=True))
-                  return {
-                      "title": title,
-                      "published": published,
-                      "text": text,
-                      "links": links,
-                  }
-              except Exception as error:
-                  print("HTML FAILED", url, error)
-                  return None
-
-          # -----------------------------------------------------------------
-          # 1. OCHA HTML UPDATES
-          # -----------------------------------------------------------------
-
-          FULL_PATTERNS = [
-              # "Between 7 October 2023 and 5 August 2024, at least
-              # 39,623 Palestinians were killed and 91,469 were injured..."
-              re.compile(
-                  rf"Between\s+7\s+October\s+2023\s+and\s+"
-                  rf"(?:\d{{1,2}}:\d{{2}}\s+(?:hours?\s+)?(?:on\s+)?)?"
-                  rf"(?P<date>\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})"
-                  rf".{{0,220}}?(?P<k>{NUMBER})\s+Palestinians?"
-                  rf".{{0,60}}?killed(?:\s+in\s+Gaza)?"
-                  rf".{{0,180}}?(?P<i>{NUMBER})\s+"
-                  rf"(?:Palestinians?\s+)?(?:were\s+)?injured",
-                  re.I | re.S,
-              ),
-
-              # "Since 7 October 2023 and as of 25 March 2025, the MoH ...
-              # 50,144 ... killed and 113,704 ... injured."
-              re.compile(
-                  rf"Since\s+7\s+October\s+2023\s+and\s+as\s+of\s+"
-                  rf"(?P<date>\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})"
-                  rf".{{0,260}}?(?P<k>{NUMBER})\s+Palestinians?"
-                  rf".{{0,80}}?killed"
-                  rf".{{0,180}}?(?P<i>{NUMBER})\s+Palestinians?"
-                  rf".{{0,50}}?injured",
-                  re.I | re.S,
-              ),
-
-              # "This brings the casualty toll among Palestinians since
-              # 7 October 2023 ... to 72,045 fatalities and 171,686 injuries."
-              re.compile(
-                  rf"(?:brings?|bringing)\s+the\s+casualty\s+toll"
-                  rf".{{0,180}}?Palestinians?"
-                  rf".{{0,180}}?since\s+7\s+October\s+2023"
-                  rf".{{0,260}}?(?P<k>{NUMBER})\s+fatalit(?:y|ies)"
-                  rf".{{0,160}}?(?P<i>{NUMBER})\s+injur(?:y|ies)",
-                  re.I | re.S,
-              ),
-
-              # Early: "Since the start of hostilities, 2,808 Palestinians
-              # have been killed and 10,850 have been injured."
-              re.compile(
-                  rf"Since\s+the\s+start\s+of\s+(?:the\s+)?hostilities"
-                  rf".{{0,160}}?(?P<k>{NUMBER})\s+Palestinians?"
-                  rf".{{0,70}}?killed"
-                  rf".{{0,180}}?(?P<i>{NUMBER})\s+"
-                  rf"(?:Palestinians?\s+)?(?:have\s+been\s+|were\s+)?injured",
-                  re.I | re.S,
-              ),
-
-              # Early split wording:
-              # "fatality toll ... stood at 11,078 ... Another 27,490
-              # Palestinians have reportedly been injured."
-              re.compile(
-                  rf"(?:fatality|casualty)\s+toll"
-                  rf".{{0,160}}?(?P<k>{NUMBER})"
-                  rf".{{0,450}}?(?:another|about|approximately)?\s*"
-                  rf"(?P<i>{NUMBER})\s+Palestinians?"
-                  rf".{{0,80}}?injured",
-                  re.I | re.S,
-              ),
-
-              # Dec 2023 style:
-              # "between 7 October and 19 December ... 19,667 ... killed...
-              # As of then, about 52,586 ... injured"
-              re.compile(
-                  rf"(?:According\s+to\s+the\s+MoH\s+in\s+Gaza,\s+)?"
-                  rf"between\s+7\s+October(?:\s+2023)?\s+and\s+"
-                  rf"(?P<date>\d{{1,2}}\s+(?:{MONTHS}))"
-                  rf".{{0,260}}?(?P<k>{NUMBER})\s+"
-                  rf"(?:people\s+)?Palestinians?"
-                  rf".{{0,80}}?killed"
-                  rf".{{0,300}}?(?P<i>{NUMBER})\s+"
-                  rf"(?:people\s+)?(?:Palestinians?\s+)?"
-                  rf".{{0,80}}?injured",
-                  re.I | re.S,
-              ),
-          ]
-
-          def valid_pair(killed, injured):
-              return (
-                  100 <= killed <= 500000
-                  and 100 <= injured <= 1000000
-                  and injured > killed
-              )
-
-          def paragraph_context(text, start, end):
-              return text[max(0, start - 300):min(len(text), end + 300)].lower()
-
-          def date_from_match(match, published):
-              if "date" in match.groupdict() and match.group("date"):
-                  raw = clean(match.group("date"))
-
-                  # December 2023 regex may omit the year.
-                  if not re.search(r"20\d{2}", raw):
-                      raw += " 2023"
-
-                  d = parse_date(raw)
-                  if d:
-                      return d
-
-              return published
-
-          def extract_html_record(url, label):
-              page = html_page(url)
-              if not page:
-                  return None
-
-              text = page["text"]
-              candidates = []
-
-              for pattern_index, pattern in enumerate(FULL_PATTERNS):
-                  for match in pattern.finditer(text):
-                      context = paragraph_context(
-                          text, match.start(), match.end()
-                      )
-
-                      # Must clearly be the Gaza/MoH series.
-                      if not any(x in context for x in (
-                          "ministry of health",
-                          "moh",
-                          "gaza",
+                      # Keep only Gaza/oPt emergency situation-report PDFs.
+                      joined = (label + " " + href).lower()
+                      if not any(term in joined for term in (
+                          "sitrep",
+                          "situation",
+                          "palestine",
+                          "opt",
                       )):
                           continue
 
-                      # Reject obvious West Bank / Israel-only passages.
-                      if (
-                          "west bank" in context
-                          and "gaza" not in context
-                      ):
-                          continue
+                      found[href] = label
 
-                      killed = parse_number(match.group("k"))
-                      injured = parse_number(match.group("i"))
-
-                      if not valid_pair(killed, injured):
-                          continue
-
-                      effective = date_from_match(
-                          match, page["published"]
-                      )
-
-                      if not effective:
-                          continue
-
-                      if not (START_DATE <= effective <= date.today()):
-                          continue
-
-                      candidates.append({
-                          "date": effective.isoformat(),
-                          "killed": killed,
-                          "injured": injured,
-                          "source_url": url,
-                          "series_label": label,
-                          "source_type": "ocha-html",
-                          "confidence": 100 - pattern_index,
-                      })
-
-              # Fallback for early pages where exact wording is:
-              # "... 18,787 Palestinians killed. About 50,589 Palestinians
-              # have reportedly been injured."
-              if not candidates:
-                  low = text.lower()
-                  if (
-                      ("ministry of health" in low or "moh" in low)
-                      and "gaza" in low
-                  ):
-                      windows = []
-                      for m in re.finditer(
-                          r"(?:killed|fatalit(?:y|ies))",
-                          text,
-                          re.I,
-                      ):
-                          windows.append(
-                              text[
-                                  max(0, m.start() - 220):
-                                  min(len(text), m.start() + 500)
-                              ]
-                          )
-
-                      for window in windows:
-                          k = re.search(
-                              rf"(?P<n>{NUMBER})\s+Palestinians?"
-                              rf".{{0,80}}?killed",
-                              window,
-                              re.I | re.S,
-                          )
-                          i = re.search(
-                              rf"(?P<n>{NUMBER})\s+"
-                              rf"(?:Palestinians?\s+)?"
-                              rf".{{0,80}}?injured",
-                              window,
-                              re.I | re.S,
-                          )
-
-                          if not (k and i):
-                              continue
-
-                          killed = parse_number(k.group("n"))
-                          injured = parse_number(i.group("n"))
-
-                          if not valid_pair(killed, injured):
-                              continue
-
-                          effective = page["published"]
-                          if not effective:
-                              continue
-
-                          candidates.append({
-                              "date": effective.isoformat(),
-                              "killed": killed,
-                              "injured": injured,
-                              "source_url": url,
-                              "series_label": label,
-                              "source_type": "ocha-html",
-                              "confidence": 88,
-                          })
-
-              if not candidates:
-                  return None
-
-              unique = {
-                  (
-                      row["date"],
-                      row["killed"],
-                      row["injured"],
-                  ): row
-                  for row in candidates
-              }
-
-              # If one page gives different plausible cumulative totals,
-              # don't guess.
-              if len(unique) != 1:
-                  print("AMBIGUOUS HTML PAGE", url, list(unique))
-                  return None
-
-              return next(iter(unique.values()))
-
-          def html_targets():
-              rows = []
-
-              for n in range(1, 40):
-                  rows.append((
-                      CONTENT
-                      + "escalation-gaza-strip-and-israel-flash-update-"
-                      + str(n),
-                      f"Flash Update #{n}",
-                  ))
-
-              for n in range(1, 220):
-                  rows.append((
-                      CONTENT
-                      + "hostilities-gaza-strip-and-israel-flash-update-"
-                      + str(n),
-                      f"Flash Update #{n}",
-                  ))
-
-              for n in range(120, 390):
-                  rows.append((
-                      CONTENT
-                      + "humanitarian-situation-update-"
-                      + str(n)
-                      + "-gaza-strip",
-                      f"Situation Update #{n}",
-                  ))
-
-              # Date-based current reports. They are useful if OCHA again
-              # publishes a full-war cumulative total in ordinary HTML.
-              current = date(2026, 2, 1)
-              today = date.today()
-              while current <= today:
-                  slug = (
-                      f"{current.day}-"
-                      f"{current.strftime('%B').lower()}-"
-                      f"{current.year}"
-                  )
-                  rows.append((
-                      CONTENT
-                      + "humanitarian-situation-report-"
-                      + slug,
-                      "Humanitarian Situation Report",
-                  ))
-                  current += timedelta(days=1)
-
-              return rows
-
-          def collect_html():
-              todo = html_targets()
-              rows = []
-
-              print("Scanning", len(todo), "OCHA HTML pages")
-
-              with ThreadPoolExecutor(max_workers=6) as executor:
-                  futures = {
-                      executor.submit(
-                          extract_html_record, url, label
-                      ): url
-                      for url, label in todo
-                  }
-
-                  done = 0
-                  for future in as_completed(futures):
-                      done += 1
-                      try:
-                          row = future.result()
-                      except Exception as error:
-                          print(
-                              "HTML PARSE FAILED",
-                              futures[future],
-                              error,
-                          )
-                          row = None
-
-                      if row:
-                          print(
-                              "HTML",
-                              row["date"],
-                              row["killed"],
-                              row["injured"],
-                              row["series_label"],
-                          )
-                          rows.append(row)
-
-                      if done % 100 == 0:
-                          print(
-                              "HTML checked",
-                              done,
-                              "/",
-                              len(todo),
-                          )
-
-              return rows
-
-          # -----------------------------------------------------------------
-          # 2. OCHA REPORTED-IMPACT SNAPSHOTS
-          # -----------------------------------------------------------------
-
-          SNAPSHOT_TITLE = re.compile(
-              r"Reported impact snapshot\s*\|\s*Gaza Strip\s*"
-              r"\(([^)]+)\)",
-              re.I,
-          )
-          EARLY_SNAPSHOT = re.compile(
-              r"(?:Hostilities in the Gaza Strip and Israel\s*-\s*)?"
-              r"reported impact\s*\|\s*Day\s*(\d+)",
-              re.I,
-          )
-
-          def discover_snapshots():
-              found = {}
-              empty_streak = 0
-
-              for page_num in range(0, 85):
-                  url = (
-                      SNAPSHOTS
-                      if page_num == 0
-                      else f"{SNAPSHOTS}?page={page_num}"
+              if not found:
+                  raise RuntimeError(
+                      "WHO EMRO emergency report archive returned no PDFs."
                   )
 
-                  page = html_page(url)
-                  if not page:
-                      empty_streak += 1
-                      if empty_streak >= 6:
-                          break
-                      continue
-
-                  soup_response = request(url)
-                  if soup_response is None:
-                      continue
-
-                  soup = BeautifulSoup(
-                      soup_response.text, "html.parser"
-                  )
-
-                  count = 0
-                  for a in soup.find_all("a", href=True):
-                      title = clean(
-                          a.get_text(" ", strip=True)
-                      )
-
-                      modern = SNAPSHOT_TITLE.search(title)
-                      early = EARLY_SNAPSHOT.search(title)
-
-                      if not (modern or early):
-                          continue
-
-                      snapshot_url = urljoin(
-                          url, a["href"]
-                      ).split("#", 1)[0]
-
-                      if modern:
-                          effective = parse_date(
-                              modern.group(1)
-                          )
-                      else:
-                          day_number = int(early.group(1))
-                          effective = (
-                              date(2023, 10, 7)
-                              + timedelta(days=day_number - 1)
-                          )
-
-                      if (
-                          effective
-                          and START_DATE <= effective <= date.today()
-                      ):
-                          found[snapshot_url] = {
-                              "url": snapshot_url,
-                              "title": title,
-                              "date": effective,
-                          }
-                          count += 1
-
-                  if count:
-                      empty_streak = 0
-                  else:
-                      empty_streak += 1
-
-                  if page_num > 15 and empty_streak >= 6:
-                      break
-
-                  time.sleep(0.05)
-
-              print(
-                  "Discovered",
-                  len(found),
-                  "OCHA Gaza snapshots",
-              )
-              return list(found.values())
+              print("Discovered", len(found), "WHO PDF candidates")
+              return found
 
           def pdf_text(url):
-              r = request(url, timeout=120)
-              if r is None:
-                  return ""
-
-              data = r.content
+              data = get(url, timeout=120).content
 
               if not data.startswith(b"%PDF"):
                   return ""
 
-              with tempfile.TemporaryDirectory() as folder:
-                  pdf = Path(folder) / "snapshot.pdf"
-                  txt = Path(folder) / "snapshot.txt"
+              with tempfile.TemporaryDirectory() as td:
+                  pdf = Path(td) / "report.pdf"
+                  txt = Path(td) / "report.txt"
                   pdf.write_bytes(data)
 
-                  process = subprocess.run(
+                  # First three pages contain the overview/casualty totals.
+                  result = subprocess.run(
                       [
                           "pdftotext",
+                          "-f", "1",
+                          "-l", "3",
                           "-layout",
                           str(pdf),
                           str(txt),
@@ -616,10 +135,7 @@ jobs:
                       text=True,
                   )
 
-                  if (
-                      process.returncode != 0
-                      or not txt.exists()
-                  ):
+                  if result.returncode != 0 or not txt.exists():
                       return ""
 
                   return txt.read_text(
@@ -627,417 +143,287 @@ jobs:
                       errors="ignore",
                   )
 
-          def snapshot_pdf_links(snapshot_url):
-              page = html_page(snapshot_url)
-              if not page:
-                  return []
+          def parse_issue(text, label):
+              match = ISSUE_RE.search(text) or ISSUE_RE.search(label)
+              return int(match.group(1)) if match else None
 
-              scored = []
-              for href in page["links"]:
-                  if not re.search(
-                      r"\.pdf(?:\?|$)",
-                      href,
-                      re.I,
-                  ):
-                      continue
-
-                  low = href.lower()
-                  score = (
-                      ("gaza" in low) * 4
-                      + ("impact" in low) * 4
-                      + ("snapshot" in low) * 4
-                      + ("reported" in low) * 2
-                  )
-                  scored.append((score, href))
-
-              scored.sort(reverse=True)
-
-              # De-duplicate while preserving score order.
-              output = []
-              seen = set()
-              for _, href in scored:
-                  if href not in seen:
-                      output.append(href)
-                      seen.add(href)
-
-              return output[:5]
-
-          def line_candidates(lines, label_regex):
-              output = []
-
-              for idx, line in enumerate(lines):
-                  if not re.search(label_regex, line, re.I):
-                      continue
-
-                  # Number may be on same line or visually above/below it.
-                  for offset in (0, -1, 1, -2, 2, -3):
-                      pos = idx + offset
-                      if not (0 <= pos < len(lines)):
-                          continue
-
-                      for m in re.finditer(NUMBER, lines[pos]):
-                          value = parse_number(m.group(0))
-                          distance = abs(offset)
-                          output.append(
-                              (distance, value, pos)
-                          )
-
-              return output
-
-          def parse_snapshot_pdf(text, effective, url):
-              lines = [
-                  line.rstrip()
-                  for line in text.splitlines()
-                  if line.strip()
+          def parse_date(text):
+              # Strongest form first: "As of 11 January 2024 at 13:00".
+              patterns = [
+                  rf"\bAs\s+of\s+(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})",
+                  rf"\b7\s+Oct\s+2023\s*-\s*(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})",
+                  rf"\bGeneral\s+updates\s*-\s*as\s+of\s+(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})",
+                  rf"\b(\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}})\b",
               ]
 
-              fatalities = line_candidates(
-                  lines,
-                  r"\breported\s+fatalit(?:y|ies)\b",
-              )
-              injuries = line_candidates(
-                  lines,
-                  r"\breported\s+injur(?:y|ies)\b",
-              )
-
-              if not fatalities:
-                  fatalities = line_candidates(
-                      lines,
-                      r"\bfatalit(?:y|ies)\b",
-                  )
-
-              if not injuries:
-                  injuries = line_candidates(
-                      lines,
-                      r"\binjur(?:y|ies)\b",
-                  )
-
-              possible = []
-
-              for kd, killed, kp in fatalities:
-                  if not (100 <= killed <= 500000):
+              for pattern in patterns:
+                  m = re.search(pattern, text[:5000], re.I)
+                  if not m:
                       continue
 
-                  for idist, injured, ip in injuries:
-                      if not (100 <= injured <= 1000000):
-                          continue
-                      if injured <= killed:
-                          continue
-
-                      # Cumulative Gaza totals have consistently had injuries
-                      # above fatalities, generally by a substantial margin.
-                      ratio = injured / killed
-                      if not (1.15 <= ratio <= 5.0):
-                          continue
-
-                      # Prefer labels/numbers close together in the layout and
-                      # larger cumulative totals over subgroup counts.
-                      score = (
-                          1000
-                          - kd * 80
-                          - idist * 80
-                          - abs(kp - ip) * 10
-                          + min(killed, 200000) / 500
-                          + min(injured, 400000) / 500
-                      )
-
-                      possible.append(
-                          (score, killed, injured)
-                      )
-
-              if not possible:
-                  return None
-
-              possible.sort(reverse=True)
-              best = possible[0]
-
-              # Reject genuinely ambiguous layouts.
-              if len(possible) > 1:
-                  second = possible[1]
-                  if (
-                      best[0] - second[0] < 20
-                      and (best[1], best[2])
-                      != (second[1], second[2])
-                  ):
-                      return None
-
-              return {
-                  "date": effective.isoformat(),
-                  "killed": best[1],
-                  "injured": best[2],
-                  "source_url": url,
-                  "series_label": "OCHA Reported Impact Snapshot",
-                  "source_type": "ocha-snapshot-pdf",
-                  "confidence": 70,
-              }
-
-          def extract_snapshot(meta):
-              links = snapshot_pdf_links(meta["url"])
-
-              for pdf in links:
                   try:
-                      text = pdf_text(pdf)
-                  except Exception as error:
-                      print("PDF READ FAILED", pdf, error)
+                      d = datetime.strptime(
+                          clean(m.group(1)),
+                          "%d %B %Y",
+                      ).date()
+                  except Exception:
                       continue
 
-                  if len(text.strip()) < 200:
-                      continue
+                  if date(2023,10,8) <= d <= date.today():
+                      return d.isoformat()
 
-                  row = parse_snapshot_pdf(
-                      text,
-                      meta["date"],
-                      meta["url"],
-                  )
+              # Some WHO PDFs abbreviate months.
+              m = re.search(
+                  r"\bAs\s+of\s+(\d{1,2}\s+"
+                  r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                  r"\s+20\d{2})",
+                  text[:5000],
+                  re.I,
+              )
 
-                  if row:
-                      row["asset_url"] = pdf
-                      return row
+              if m:
+                  try:
+                      d = datetime.strptime(
+                          clean(m.group(1)),
+                          "%d %b %Y",
+                      ).date()
+                      if date(2023,10,8) <= d <= date.today():
+                          return d.isoformat()
+                  except Exception:
+                      pass
 
               return None
 
-          def collect_snapshots(existing_html):
-              metas = discover_snapshots()
+          def n(raw):
+              return int(re.sub(r"[\s,]", "", raw))
 
-              # We don't need every snapshot if HTML already gives good
-              # weekly coverage. Parse at most one snapshot per ISO week,
-              # choosing the latest one in each week.
-              weeks = {}
-              for meta in metas:
-                  iso = meta["date"].isocalendar()
-                  key = (iso.year, iso.week)
-                  if (
-                      key not in weeks
-                      or meta["date"] > weeks[key]["date"]
-                  ):
-                      weeks[key] = meta
+          NUM = r"\d{1,3}(?:[,\s]\d{3})+|\d{3,6}"
 
-              selected = list(weeks.values())
-              selected.sort(key=lambda x: x["date"])
-
-              print(
-                  "Parsing",
-                  len(selected),
-                  "weekly snapshot candidates",
+          def valid(killed, injured):
+              return (
+                  100 <= killed <= 500000
+                  and 100 <= injured <= 1000000
+                  and injured > killed
               )
 
-              rows = []
+          def candidate_pairs(text):
+              """
+              Return only pairs from WHO's explicit Gaza headline/cumulative
+              formats. No contextual guessing and no 'nearest number' logic.
+              """
+              candidates = []
 
-              # PDFs are heavier; keep concurrency low.
-              with ThreadPoolExecutor(max_workers=3) as executor:
-                  futures = {
-                      executor.submit(extract_snapshot, meta):
-                      meta["url"]
-                      for meta in selected
-                  }
+              # Format A: Issue 10 style:
+              # 8,805 Number of people killed in Gaza
+              # 22,240 Number of people injured in Gaza
+              killed = re.findall(
+                  rf"({NUM})\s+"
+                  rf"(?:Number\s+of\s+people\s+)?"
+                  rf"killed\s+in\s+Gaza",
+                  text,
+                  re.I,
+              )
+              injured = re.findall(
+                  rf"({NUM})\s+"
+                  rf"(?:Number\s+of\s+people\s+)?"
+                  rf"injured\s+in\s+Gaza",
+                  text,
+                  re.I,
+              )
 
-                  done = 0
-                  for future in as_completed(futures):
-                      done += 1
-                      try:
-                          row = future.result()
-                      except Exception as error:
-                          print(
-                              "SNAPSHOT PARSE FAILED",
-                              futures[future],
-                              error,
-                          )
-                          row = None
+              for k in killed:
+                  for i in injured:
+                      kv, iv = n(k), n(i)
+                      if valid(kv, iv):
+                          candidates.append((kv, iv, "labelled-gaza"))
 
-                      if row:
-                          print(
-                              "SNAPSHOT",
-                              row["date"],
-                              row["killed"],
-                              row["injured"],
-                          )
-                          rows.append(row)
-
-                      if done % 25 == 0:
-                          print(
-                              "Snapshots checked",
-                              done,
-                              "/",
-                              len(selected),
-                          )
-
-              return rows
-
-          # -----------------------------------------------------------------
-          # 3. CROSS-CHECK, WEEKLY SAMPLING, MONTHLY COVERAGE ASSERTION
-          # -----------------------------------------------------------------
-
-          def plausible_transition(previous, current):
-              if not previous:
-                  return True
-
-              d1 = datetime.fromisoformat(
-                  previous["date"]
-              ).date()
-              d2 = datetime.fromisoformat(
-                  current["date"]
-              ).date()
-
-              if d2 <= d1:
-                  return False
+              # Format B: WHO overview cards:
+              # 35,456 Fatalities
+              # 79,476 Injuries
+              #
+              # Restrict this to the first-page overview zone and require
+              # "Gaza Strip" + "Source: Ministry of Health".
+              overview = text[:9000]
+              low = overview.lower()
 
               if (
-                  current["killed"] < previous["killed"]
-                  or current["injured"] < previous["injured"]
+                  "gaza strip" in low
+                  and (
+                      "source: ministry of health" in low
+                      or "source: ministry of health." in low
+                  )
               ):
-                  return False
+                  fatality_matches = re.findall(
+                      rf"({NUM})\s+Fatalities\b",
+                      overview,
+                      re.I,
+                  )
+                  injury_matches = re.findall(
+                      rf"({NUM})\s+Injuries\b",
+                      overview,
+                      re.I,
+                  )
 
-              days = max(1, (d2 - d1).days)
-              killed_rate = (
-                  current["killed"]
-                  - previous["killed"]
-              ) / days
-              injured_rate = (
-                  current["injured"]
-                  - previous["injured"]
-              ) / days
+                  for k in fatality_matches:
+                      for i in injury_matches:
+                          kv, iv = n(k), n(i)
+                          if valid(kv, iv):
+                              candidates.append(
+                                  (kv, iv, "who-overview-cards")
+                              )
 
-              # Very generous parser-error guards, not substantive claims.
-              return (
-                  killed_rate <= 5000
-                  and injured_rate <= 15000
+              # Format C: later WHO narrative:
+              # "This brings the cumulative toll since October 2023 to
+              # 68 858 deaths and 170 664 injuries."
+              cumulative_patterns = [
+                  re.compile(
+                      rf"(?:cumulative(?:ly)?|cumulative\s+toll)"
+                      rf".{{0,100}}?since\s+October\s+2023"
+                      rf".{{0,120}}?(?P<k>{NUM})\s+"
+                      rf"(?:deaths|fatalities|people\s+have\s+been\s+killed|people\s+killed)"
+                      rf".{{0,120}}?(?P<i>{NUM})\s+"
+                      rf"(?:injuries|injured)",
+                      re.I | re.S,
+                  ),
+                  re.compile(
+                      rf"brings?\s+the\s+cumulative\s+toll"
+                      rf".{{0,80}}?since\s+October\s+2023"
+                      rf".{{0,100}}?(?P<k>{NUM})\s+"
+                      rf"(?:deaths|fatalities)"
+                      rf".{{0,100}}?(?P<i>{NUM})\s+"
+                      rf"(?:injuries|injured)",
+                      re.I | re.S,
+                  ),
+                  re.compile(
+                      rf"Cumulatively,\s+since\s+October\s+2023,"
+                      rf".{{0,100}}?(?P<k>{NUM})\s+"
+                      rf"(?:people\s+)?(?:have\s+been\s+)?killed"
+                      rf".{{0,100}}?(?P<i>{NUM})\s+injured",
+                      re.I | re.S,
+                  ),
+              ]
+
+              for pattern in cumulative_patterns:
+                  for m in pattern.finditer(text):
+                      kv = n(m.group("k"))
+                      iv = n(m.group("i"))
+                      if valid(kv, iv):
+                          candidates.append(
+                              (kv, iv, "explicit-cumulative")
+                          )
+
+              return candidates
+
+          def parse_report(url, label):
+              try:
+                  text = pdf_text(url)
+              except Exception as error:
+                  print("PDF failed:", url, error)
+                  return None
+
+              if len(text.strip()) < 200:
+                  return None
+
+              effective = parse_date(text)
+              if not effective:
+                  return None
+
+              pairs = candidate_pairs(text)
+              if not pairs:
+                  return None
+
+              # Collapse duplicate extractions of the same pair.
+              by_pair = {}
+              for killed, injured, method in pairs:
+                  by_pair.setdefault(
+                      (killed, injured),
+                      set(),
+                  ).add(method)
+
+              if len(by_pair) != 1:
+                  print(
+                      "AMBIGUOUS WHO REPORT OMITTED",
+                      url,
+                      list(by_pair),
+                  )
+                  return None
+
+              (killed, injured), methods = next(
+                  iter(by_pair.items())
               )
 
-          def reconcile(html_rows, snapshot_rows):
-              all_rows = html_rows + snapshot_rows
+              issue = parse_issue(text, label)
 
-              # De-duplicate same date. Prefer HTML because the cumulative
-              # statement is directly machine-readable and source-attributed.
+              return {
+                  "date": effective,
+                  "killed": killed,
+                  "injured": injured,
+                  "source_url": url,
+                  "series_label": (
+                      f"WHO Emergency Situation Report"
+                      + (f" #{issue}" if issue else "")
+                  ),
+                  "source_type": "WHO EMRO",
+                  "parse_method": "+".join(sorted(methods)),
+                  "parser_version": VERSION,
+              }
+
+          def validate(rows):
+              # Same-date dedupe.
               by_date = {}
 
-              for row in all_rows:
-                  key = row["date"]
+              for row in rows:
+                  d = row["date"]
 
-                  if key not in by_date:
-                      by_date[key] = row
+                  if d not in by_date:
+                      by_date[d] = row
                       continue
 
-                  old = by_date[key]
+                  old = by_date[d]
 
                   if (
                       old["killed"] == row["killed"]
                       and old["injured"] == row["injured"]
                   ):
-                      if row["source_type"] == "ocha-html":
-                          by_date[key] = row
                       continue
 
-                  # Conflict: HTML wins over PDF. PDF-vs-PDF conflict is omitted.
-                  if old["source_type"] == "ocha-html":
-                      continue
-                  if row["source_type"] == "ocha-html":
-                      by_date[key] = row
-                  else:
-                      by_date[key] = None
-                      print("PDF DATE CONFLICT", key)
+                  # Two WHO reports disagreeing for the same as-of date:
+                  # omit rather than choose.
+                  print(
+                      "WHO DATE CONFLICT OMITTED",
+                      d,
+                      (old["killed"], old["injured"]),
+                      (row["killed"], row["injured"]),
+                  )
+                  by_date[d] = None
 
-              candidates = [
+              ordered = [
                   row
                   for row in by_date.values()
                   if row is not None
               ]
-              candidates.sort(key=lambda r: r["date"])
+              ordered.sort(key=lambda r: r["date"])
 
-              # Walk forward and reject implausible transitions.
-              valid = []
-              for row in candidates:
-                  if plausible_transition(
-                      valid[-1] if valid else None,
-                      row,
-                  ):
-                      valid.append(row)
-                  else:
-                      print(
-                          "TRANSITION OMITTED",
-                          row,
-                      )
+              final = []
 
-              # One point per ISO week, choose the latest trusted point.
-              weekly = {}
-              for row in valid:
-                  d = datetime.fromisoformat(
-                      row["date"]
-                  ).date()
-                  iso = d.isocalendar()
-                  key = (iso.year, iso.week)
+              for row in ordered:
+                  if final:
+                      prev = final[-1]
 
-                  old = weekly.get(key)
-                  if old is None:
-                      weekly[key] = row
-                      continue
+                      # Cumulative totals should not go backwards.
+                      if (
+                          row["killed"] < prev["killed"]
+                          or row["injured"] < prev["injured"]
+                      ):
+                          print(
+                              "DECREASING WHO POINT OMITTED",
+                              row,
+                          )
+                          continue
 
-                  old_date = datetime.fromisoformat(
-                      old["date"]
-                  ).date()
+                  final.append(row)
 
-                  if d > old_date:
-                      weekly[key] = row
-                  elif (
-                      d == old_date
-                      and row["source_type"] == "ocha-html"
-                  ):
-                      weekly[key] = row
-
-              output = list(weekly.values())
-              output.sort(key=lambda r: r["date"])
-              return output
-
-          def month_range(start, end):
-              year, month = start.year, start.month
-              while (year, month) <= (end.year, end.month):
-                  yield year, month
-                  if month == 12:
-                      year += 1
-                      month = 1
-                  else:
-                      month += 1
-
-          def assert_monthly_coverage(rows):
-              if not rows:
-                  raise RuntimeError(
-                      "No casualty records were produced."
-                  )
-
-              first = datetime.fromisoformat(
-                  rows[0]["date"]
-              ).date()
-              last = datetime.fromisoformat(
-                  rows[-1]["date"]
-              ).date()
-
-              present = {
-                  (
-                      datetime.fromisoformat(
-                          row["date"]
-                      ).year,
-                      datetime.fromisoformat(
-                          row["date"]
-                      ).month,
-                  )
-                  for row in rows
-              }
-
-              missing = []
-              for year, month in month_range(
-                  max(first, START_DATE),
-                  last,
-              ):
-                  if (year, month) not in present:
-                      missing.append(
-                          f"{calendar.month_name[month]} {year}"
-                      )
-
-              if missing:
-                  raise RuntimeError(
-                      "Refusing to publish: no trustworthy casualty "
-                      "point was found for these month(s): "
-                      + ", ".join(missing)
-                  )
+              return final
 
           def main():
               OUT.parent.mkdir(
@@ -1045,27 +431,41 @@ jobs:
                   exist_ok=True,
               )
 
-              html_rows = collect_html()
-              snapshot_rows = collect_snapshots(
-                  html_rows
-              )
+              reports = discover()
+              rows = []
 
-              weekly = reconcile(
-                  html_rows,
-                  snapshot_rows,
-              )
+              # WHO archive is small enough to parse sequentially and gently.
+              for index, (url, label) in enumerate(
+                  reports.items(),
+                  start=1,
+              ):
+                  print(
+                      f"Parsing WHO report {index}/{len(reports)}"
+                  )
 
-              weekly = [
-                  row
-                  for row in weekly
-                  if row["date"] >= "2023-10-08"
-              ]
+                  row = parse_report(url, label)
 
-              assert_monthly_coverage(weekly)
+                  if row:
+                      print(
+                          "FOUND",
+                          row["date"],
+                          row["killed"],
+                          row["injured"],
+                          row["series_label"],
+                      )
+                      rows.append(row)
 
-              public = []
-              for row in weekly:
-                  public.append({
+              rows = validate(rows)
+
+              if not rows:
+                  raise RuntimeError(
+                      "No unambiguous WHO Gaza casualty totals were parsed."
+                  )
+
+              # Never fill gaps or interpolate. Accuracy is preferred over
+              # frequency. The frontend can calculate rates between points.
+              public = [
+                  {
                       "date": row["date"],
                       "killed": row["killed"],
                       "injured": row["injured"],
@@ -1073,19 +473,23 @@ jobs:
                       "series_label": row["series_label"],
                       "source_type": row["source_type"],
                       "parser_version": VERSION,
-                  })
+                  }
+                  for row in rows
+              ]
 
               payload = {
                   "source": (
-                      "UN OCHA oPt Gaza HTML updates and official "
-                      "Reported Impact Snapshots; Palestinian casualty "
-                      "figures are attributed by OCHA to the Gaza "
-                      "Ministry of Health."
+                      "WHO Eastern Mediterranean Regional Office "
+                      "Gaza/oPt Emergency Situation Reports"
                   ),
-                  "sampling": (
-                      "Maximum one trusted point per ISO week. "
-                      "Workflow refuses to publish if a calendar month "
-                      "within the covered range has no trusted point."
+                  "underlying_source": (
+                      "Gaza Ministry of Health, as cited by WHO"
+                  ),
+                  "method": (
+                      "Only explicit WHO-labelled Gaza totals or explicit "
+                      "cumulative-since-October-2023 casualty statements "
+                      "are accepted. No OCR, interpolation, nearest-number "
+                      "matching, or inferred totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
@@ -1106,7 +510,7 @@ jobs:
               print(
                   "SUCCESS:",
                   len(public),
-                  "weekly points from",
+                  "WHO records from",
                   public[0]["date"],
                   "through",
                   public[-1]["date"],
@@ -1116,7 +520,7 @@ jobs:
               main()
           PY
 
-          python /tmp/update_casualties.py
+          python /tmp/update_who.py
 
       - name: Commit casualty timeline
         run: |
@@ -1124,5 +528,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/casualty-timeline.json
           git diff --cached --quiet && exit 0
-          git commit -m "Update weekly Gaza casualty timeline"
+          git commit -m "Update Gaza casualty timeline from WHO"
           git push
