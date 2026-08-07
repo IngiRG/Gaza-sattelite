@@ -42,7 +42,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 10
+          VERSION = 11
 
           ARCHIVES = [
               "https://www.emro.who.int/opt/information-resources/emergency-situation-reports.html",
@@ -187,7 +187,57 @@ jobs:
 
               return output
 
-          def resolve_pdf(url):
+          def pdf_first_page_issue(pdf_bytes):
+              """
+              Return the WHO issue number printed on page 1, if present.
+              Used to prevent an intermediate WHO page from sending us to
+              a different issue's PDF.
+              """
+              with tempfile.TemporaryDirectory() as folder:
+                  pdf = Path(folder) / "candidate.pdf"
+                  txt = Path(folder) / "candidate.txt"
+                  pdf.write_bytes(pdf_bytes)
+
+                  result = subprocess.run(
+                      [
+                          "pdftotext",
+                          "-f", "1",
+                          "-l", "1",
+                          "-layout",
+                          str(pdf),
+                          str(txt),
+                      ],
+                      capture_output=True,
+                      text=True,
+                  )
+
+                  if (
+                      result.returncode != 0
+                      or not txt.exists()
+                  ):
+                      return None
+
+                  content = txt.read_text(
+                      encoding="utf-8",
+                      errors="ignore",
+                  )
+
+                  match = PDF_ISSUE.search(content[:2500])
+                  return (
+                      int(match.group(1))
+                      if match else None
+                  )
+
+          def resolve_pdf(url, expected_issue):
+              """
+              Resolve the WHO archive link to the PDF for exactly
+              expected_issue.
+
+              Some WHO archive links open an intermediate page containing
+              multiple situation-report PDFs. The older resolver simply chose
+              the highest-scoring PDF and could therefore select a later issue.
+              This version verifies the issue number printed on page 1.
+              """
               r = get(url, timeout=90)
 
               ctype = (
@@ -197,59 +247,139 @@ jobs:
                   ).lower()
               )
 
+              # Direct PDF link: only accept it if the printed issue matches.
               if (
                   r.content.startswith(b"%PDF")
                   or "application/pdf" in ctype
               ):
-                  return r.url, r.content
+                  actual_issue = pdf_first_page_issue(
+                      r.content
+                  )
 
-              # If WHO linked to an intermediate page, locate the PDF there.
+                  if (
+                      actual_issue is None
+                      or actual_issue == expected_issue
+                  ):
+                      return r.url, r.content
+
+                  raise RuntimeError(
+                      f"direct PDF is issue {actual_issue}, "
+                      f"expected issue {expected_issue}"
+                  )
+
               soup = BeautifulSoup(
                   r.text,
                   "html.parser",
               )
 
-              pdfs = []
+              candidates = []
 
               for a in soup.find_all("a", href=True):
-                  href = urljoin(r.url, a["href"])
+                  href = urljoin(
+                      r.url,
+                      a["href"],
+                  )
 
-                  if ".pdf" in href.lower():
-                      label = clean(
-                          a.get_text(" ", strip=True)
-                      ).lower()
+                  if ".pdf" not in href.lower():
+                      continue
 
-                      score = (
-                          ("download" in label) * 2
-                          + ("report" in label) * 2
-                          + ("sitrep" in href.lower()) * 3
-                          + ("palestine" in href.lower()) * 2
-                      )
+                  label = clean(
+                      a.get_text(" ", strip=True)
+                  ).lower()
+                  low_href = href.lower()
 
-                      pdfs.append(
-                          (score, href)
-                      )
+                  score = 0
 
-              if not pdfs:
+                  # Strongly prefer a link whose visible text/filename
+                  # mentions the exact expected issue.
+                  issue_tokens = (
+                      f"issue-{expected_issue}",
+                      f"issue_{expected_issue}",
+                      f"issue {expected_issue}",
+                      f"sitrep_{expected_issue}",
+                      f"sitrep-{expected_issue}",
+                      f"sitrep{expected_issue}",
+                  )
+
+                  combined = label + " " + low_href
+
+                  if any(
+                      token in combined
+                      for token in issue_tokens
+                  ):
+                      score += 100
+
+                  score += (
+                      ("download" in label) * 2
+                      + ("report" in label) * 2
+                      + ("sitrep" in low_href) * 3
+                      + ("palestine" in low_href) * 2
+                      + ("opt" in low_href) * 2
+                  )
+
+                  candidates.append(
+                      (score, href)
+                  )
+
+              if not candidates:
                   raise RuntimeError(
-                      "WHO archive link did not resolve to a PDF: "
+                      "WHO archive link did not expose any PDFs: "
                       + url
                   )
 
-              pdfs.sort(reverse=True)
+              # Highest-likelihood links first, but verify the printed
+              # issue number before accepting anything.
+              candidates.sort(
+                  key=lambda item: item[0],
+                  reverse=True,
+              )
 
-              for _, href in pdfs[:5]:
-                  candidate = get(
-                      href,
-                      timeout=120,
+              seen = set()
+
+              for _, href in candidates:
+                  if href in seen:
+                      continue
+                  seen.add(href)
+
+                  try:
+                      candidate = get(
+                          href,
+                          timeout=120,
+                      )
+                  except Exception as error:
+                      print(
+                          "Candidate PDF fetch failed:",
+                          href,
+                          error,
+                      )
+                      continue
+
+                  if not candidate.content.startswith(b"%PDF"):
+                      continue
+
+                  actual_issue = pdf_first_page_issue(
+                      candidate.content
                   )
 
-                  if candidate.content.startswith(b"%PDF"):
-                      return candidate.url, candidate.content
+                  if actual_issue == expected_issue:
+                      print(
+                          f"Resolved archive issue {expected_issue} "
+                          f"to matching PDF: {candidate.url}"
+                      )
+                      return (
+                          candidate.url,
+                          candidate.content,
+                      )
+
+                  print(
+                      f"Rejected candidate PDF for issue "
+                      f"{expected_issue}: printed issue "
+                      f"{actual_issue} ({candidate.url})"
+                  )
 
               raise RuntimeError(
-                  "No valid PDF found from WHO page: "
-                  + url
+                  f"No PDF with printed issue {expected_issue} "
+                  f"was found from WHO archive link {url}"
               )
 
           def first_page_text(pdf_bytes):
@@ -513,7 +643,8 @@ jobs:
           def parse_issue(meta):
               try:
                   pdf_url, pdf_bytes = resolve_pdf(
-                      meta["url"]
+                      meta["url"],
+                      meta["issue"],
                   )
               except Exception as error:
                   print(
