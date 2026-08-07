@@ -1,0 +1,398 @@
+name: Update OCHA Gaza timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "35 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install parser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr
+          pip install requests beautifulsoup4 pillow pytesseract pypdf
+
+      - name: Update OCHA snapshot data
+        shell: bash
+        run: |
+          cat > /tmp/update_ocha.py <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from urllib.parse import urljoin
+          import io
+          import json
+          import re
+          import subprocess
+          import tempfile
+          import time
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          import pytesseract
+
+          BASE="https://www.ochaopt.org"
+          LISTING=BASE+"/page/publications/snapshots"
+          OUT=Path("data/ocha-snapshots.json")
+          VERSION=1
+
+          session=requests.Session()
+          session.headers.update({
+              "User-Agent":"DestructionVisualized-OCHA/1.0",
+              "Accept-Language":"en",
+          })
+
+          TITLE_RE=re.compile(
+              r"Reported impact snapshot\s*\|\s*Gaza Strip\s*\(([^)]+)\)",
+              re.I
+          )
+
+          def clean(s):
+              return re.sub(r"\s+"," ",s or "").strip()
+
+          def get(url,timeout=90):
+              r=session.get(url,timeout=timeout)
+              r.raise_for_status()
+              return r
+
+          def parse_date_from_title(title):
+              m=TITLE_RE.search(title)
+              if not m:return None
+              raw=clean(m.group(1))
+              for fmt in ("%d %B %Y","%d %b %Y"):
+                  try:return datetime.strptime(raw,fmt).date().isoformat()
+                  except Exception:pass
+              return None
+
+          def discover():
+              found={}
+              empty=0
+              for page in range(0,120):
+                  url=LISTING if page==0 else f"{LISTING}?page={page}"
+                  print("Listing",page)
+                  try:
+                      soup=BeautifulSoup(get(url).text,"html.parser")
+                  except Exception as e:
+                      print("listing failed",e)
+                      empty+=1
+                      if empty>=6:break
+                      continue
+
+                  count=0
+                  for a in soup.find_all("a",href=True):
+                      title=clean(a.get_text(" ",strip=True))
+                      if not TITLE_RE.search(title):
+                          continue
+                      href=urljoin(BASE,a["href"])
+                      date=parse_date_from_title(title)
+                      if date:
+                          found[date]={"snapshot_date":date,"title":title,"url":href}
+                          count+=1
+
+                  if count:
+                      empty=0
+                  else:
+                      empty+=1
+                      if page>5 and empty>=6:break
+                  time.sleep(.1)
+
+              if not found:
+                  raise RuntimeError("No OCHA Gaza impact snapshots discovered.")
+              return [found[k] for k in sorted(found)]
+
+          def candidate_assets(page_url):
+              soup=BeautifulSoup(get(page_url).text,"html.parser")
+              pdfs=[]
+              images=[]
+
+              for a in soup.find_all("a",href=True):
+                  href=urljoin(page_url,a["href"])
+                  if re.search(r"\.pdf(?:\?|$)",href,re.I):
+                      pdfs.append(href)
+
+              for tag in soup.find_all(["img","source"]):
+                  for attr in ("src","data-src","srcset"):
+                      value=tag.get(attr)
+                      if not value:continue
+                      for part in value.split(","):
+                          href=part.strip().split(" ")[0]
+                          if not href:continue
+                          href=urljoin(page_url,href)
+                          if re.search(r"\.(?:png|jpe?g|webp)(?:\?|$)",href,re.I):
+                              images.append(href)
+
+              # Prefer assets that contain snapshot/Gaza keywords.
+              def score(u):
+                  low=u.lower()
+                  return (
+                      ("gaza" in low)*4+
+                      ("snapshot" in low)*4+
+                      ("impact" in low)*2+
+                      ("sites/default/files" in low)
+                  )
+              return sorted(set(pdfs),key=score,reverse=True),sorted(set(images),key=score,reverse=True)
+
+          def pdf_text(url):
+              data=get(url,120).content
+              with tempfile.TemporaryDirectory() as td:
+                  p=Path(td)/"x.pdf"
+                  t=Path(td)/"x.txt"
+                  p.write_bytes(data)
+                  cp=subprocess.run(
+                      ["pdftotext","-layout",str(p),str(t)],
+                      capture_output=True,text=True
+                  )
+                  if cp.returncode==0 and t.exists():
+                      text=t.read_text(errors="ignore")
+                      if len(text.strip())>200:return text
+              return ""
+
+          def image_text(url):
+              data=get(url,120).content
+              img=Image.open(io.BytesIO(data)).convert("RGB")
+              # Avoid tiny logos/thumbnails.
+              if img.width<700 or img.height<700:return ""
+              return pytesseract.image_to_string(img,lang="eng",config="--psm 6")
+
+          def extract_source_text(page_url):
+              pdfs,images=candidate_assets(page_url)
+
+              for url in pdfs[:5]:
+                  try:
+                      text=pdf_text(url)
+                      if len(text)>500:
+                          return text,url,"pdf"
+                  except Exception as e:
+                      print("pdf failed",url,e)
+
+              for url in images[:8]:
+                  try:
+                      text=image_text(url)
+                      if len(text)>500:
+                          return text,url,"image"
+                  except Exception as e:
+                      print("image failed",url,e)
+
+              # Last resort: visible page text; usually only disclaimer/date.
+              soup=BeautifulSoup(get(page_url).text,"html.parser")
+              return soup.get_text("\n",strip=True),page_url,"html"
+
+          def normalize(text):
+              return clean(
+                  text.replace("’","'")
+                      .replace("–","-")
+                      .replace("—","-")
+              )
+
+          def parse_scaled_number(token):
+              token=token.strip().lower().replace(",","")
+              m=re.fullmatch(r"(\d+(?:\.\d+)?)\s*(million|m|thousand|k)?",token)
+              if not m:return None
+              val=float(m.group(1))
+              unit=m.group(2)
+              if unit in ("million","m"):val*=1_000_000
+              elif unit in ("thousand","k"):val*=1_000
+              return int(round(val))
+
+          NUM=r"(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?\s*(?:million|thousand|[mk])?)"
+
+          def candidates_near(text,labels,window=160):
+              low=text.lower()
+              out=[]
+              for label in labels:
+                  for m in re.finditer(label,low,re.I):
+                      start=max(0,m.start()-window)
+                      end=min(len(text),m.end()+window)
+                      piece=text[start:end]
+                      for n in re.finditer(NUM,piece,re.I):
+                          value=parse_scaled_number(n.group(1))
+                          if value is not None:
+                              distance=abs((start+n.start())-m.start())
+                              out.append((distance,value,piece))
+              out.sort(key=lambda x:x[0])
+              return out
+
+          def pick_metric(text,labels,minv,maxv,prefer_large=False):
+              vals=[
+                  item for item in candidates_near(text,labels)
+                  if minv<=item[1]<=maxv
+              ]
+              if not vals:return None
+              # Closest valid value wins; if several are similarly close,
+              # prefer the larger cumulative number.
+              best_distance=vals[0][0]
+              close=[v for v in vals if v[0]<=best_distance+35]
+              if prefer_large:
+                  return max(close,key=lambda x:x[1])[1]
+              return close[0][1]
+
+          def parse_metrics(raw):
+              text=normalize(raw)
+
+              fatalities=pick_metric(
+                  text,
+                  [r"\breported fatalities\b",r"\bfatalities\b",r"\bkilled\b"],
+                  100,500000,True
+              )
+              injuries=pick_metric(
+                  text,
+                  [r"\breported injuries\b",r"\binjuries\b",r"\binjured\b"],
+                  100,800000,True
+              )
+
+              # Reject an obvious duplicate caused by one number being picked
+              # for both labels unless nearby text explicitly says both.
+              if fatalities is not None and injuries==fatalities:
+                  injuries=None
+
+              displaced_num=pick_metric(
+                  text,
+                  [r"\bdisplaced\b",r"\binternally displaced\b",r"\bidps?\b"],
+                  1000,3_000_000,True
+              )
+              displaced=f"{displaced_num:,} people" if displaced_num else None
+
+              hospitals_num=pick_metric(
+                  text,
+                  [r"\bhospitals? functioning\b",
+                   r"\bpartially functioning hospitals?\b",
+                   r"\bfunctional hospitals?\b"],
+                  1,100
+              )
+              hospitals=f"{hospitals_num} hospitals" if hospitals_num else None
+
+              schools_num=pick_metric(
+                  text,
+                  [r"\bschools?\b",r"\beducation facilities\b"],
+                  1,5000,True
+              )
+              schools=f"{schools_num:,} schools / education facilities" if schools_num else None
+
+              aid_num=pick_metric(
+                  text,
+                  [r"\baid trucks?\b",r"\btruckloads?\b",r"\btrucks entered\b"],
+                  1,2_000_000,True
+              )
+              aid=f"{aid_num:,} trucks / truckloads" if aid_num else None
+
+              # Cross-field sanity checks.
+              if fatalities and injuries and injuries<fatalities:
+                  injuries=None
+              if displaced_num and displaced_num>2_500_000:
+                  displaced=None
+
+              return {
+                  "fatalities":fatalities,
+                  "injuries":injuries,
+                  "displaced":displaced,
+                  "hospitals":hospitals,
+                  "schools":schools,
+                  "aid_access":aid,
+              }
+
+          def casualty_source_from_page(url):
+              soup=BeautifulSoup(get(url).text,"html.parser")
+              txt=clean(soup.get_text(" ",strip=True)).lower()
+              if "ministry of health" in txt and "israeli authorities" in txt:
+                  return "MoH / Israeli authorities, as attributed by OCHA"
+              if "ministry of health" in txt:
+                  return "Gaza Ministry of Health, as attributed by OCHA"
+              return "OCHA snapshot"
+
+          def load_old():
+              if not OUT.exists():return {}
+              try:
+                  data=json.loads(OUT.read_text())
+                  return {s["snapshot_date"]:s for s in data.get("snapshots",[])}
+              except Exception:return {}
+
+          def main():
+              OUT.parent.mkdir(parents=True,exist_ok=True)
+              old=load_old()
+              discovered=discover()
+              snapshots=[]
+
+              for i,meta in enumerate(discovered,1):
+                  previous=old.get(meta["snapshot_date"])
+                  if previous and previous.get("parser_version")==VERSION:
+                      snapshots.append(previous)
+                      continue
+
+                  print("Parsing",meta["snapshot_date"],i,"/",len(discovered))
+                  try:
+                      text,asset,kind=extract_source_text(meta["url"])
+                      metrics=parse_metrics(text)
+                      row={
+                          **meta,
+                          **metrics,
+                          "casualty_source":casualty_source_from_page(meta["url"]),
+                          "asset_url":asset,
+                          "asset_type":kind,
+                          "parser_version":VERSION,
+                      }
+
+                      # Do not publish a newly parsed row if BOTH headline
+                      # casualty fields are absent; preserve old row if any.
+                      if row["fatalities"] is None and row["injuries"] is None:
+                          if previous:
+                              snapshots.append(previous)
+                          else:
+                              print("Skipping weak parse",meta["snapshot_date"])
+                      else:
+                          snapshots.append(row)
+
+                  except Exception as e:
+                      print("snapshot failed",meta["url"],e)
+                      if previous:snapshots.append(previous)
+
+                  time.sleep(.15)
+
+              # Preserve historical snapshots temporarily missed by listing.
+              present={s["snapshot_date"] for s in snapshots}
+              for date,row in old.items():
+                  if date not in present:
+                      snapshots.append(row)
+
+              snapshots.sort(key=lambda s:s["snapshot_date"])
+
+              if not snapshots:
+                  raise RuntimeError("No OCHA snapshots parsed.")
+
+              payload={
+                  "source":"UN OCHA oPt Reported impact snapshot | Gaza Strip",
+                  "source_index":LISTING,
+                  "updated_at":datetime.now(timezone.utc).isoformat(),
+                  "parser_version":VERSION,
+                  "snapshots":snapshots,
+              }
+              OUT.write_text(json.dumps(payload,indent=2,ensure_ascii=False))
+              print("Wrote",len(snapshots),"snapshots")
+
+          if __name__=="__main__":
+              main()
+          PY
+
+          python /tmp/update_ocha.py
+
+      - name: Commit OCHA timeline data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ocha-snapshots.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update OCHA Gaza impact timeline"
+          git push
