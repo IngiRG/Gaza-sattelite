@@ -1,48 +1,180 @@
 {
-  "source": "UN OCHA oPt Gaza updates; Palestinian casualty totals attributed by OCHA to the Gaza Ministry of Health.",
-  "method": "Context-based extraction of cumulative killed/injured pairs near Gaza/MoH casualty language, with ambiguity, monotonicity, and jump checks.",
-  "updated_at": "2026-08-07T22:03:38.916840+00:00",
-  "parser_version": 6,
+  "source": "WHO Eastern Mediterranean Regional Office Gaza/oPt Emergency Situation Reports",
+  "underlying_source": "Gaza Ministry of Health, as cited by WHO",
+  "method": "Only explicit WHO-labelled Gaza totals or explicit cumulative-since-October-2023 casualty statements are accepted. No OCR, interpolation, nearest-number matching, or inferred totals.",
+  "updated_at": "2026-08-07T22:30:45.579115+00:00",
+  "parser_version": 9,
   "records": [
     {
-      "date": "2023-10-08",
-      "killed": 159,
-      "injured": 1210,
-      "source_url": "https://www.ochaopt.org/content/escalation-gaza-strip-and-israel-flash-update-2",
-      "series_label": "Flash Update #2",
-      "parser_version": 6
-    },
-    {
-      "date": "2023-10-16",
-      "killed": 558,
+      "date": "2023-11-15",
+      "killed": 11078,
       "injured": 27490,
-      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-36",
-      "series_label": "Flash Update #36",
-      "parser_version": 6
+      "source_url": "https://www.emro.who.int/images/stories/palestine/WHO_Sitrep_13.pdf",
+      "series_label": "WHO Emergency Situation Report #13",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
     },
     {
-      "date": "2023-11-02",
-      "killed": 558,
-      "injured": 27490,
-      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-35",
-      "series_label": "Flash Update #35",
-      "parser_version": 6
+      "date": "2023-11-23",
+      "killed": 14854,
+      "injured": 36000,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/oPt_Emergency_Situation_Update_-_NOV24.pdf",
+      "series_label": "WHO Emergency Situation Report #14",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
     },
     {
-      "date": "2023-12-06",
-      "killed": 18608,
-      "injured": 50594,
-      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-68",
-      "series_label": "Flash Update #68",
-      "parser_version": 6
+      "date": "2023-11-29",
+      "killed": 15000,
+      "injured": 36000,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/oPt_Emergency_Situation_Update_-_NOV28.pdf",
+      "series_label": "WHO Emergency Situation Report #15",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
     },
     {
-      "date": "2024-02-07",
-      "killed": 67147,
-      "injured": 300000,
-      "source_url": "https://www.ochaopt.org/content/hostilities-gaza-strip-and-israel-flash-update-113",
-      "series_label": "Flash Update #113",
-      "parser_version": 6
+      "date": "2023-12-07",
+      "killed": 17487,
+      "injured": 46480,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/oPt_Emergency_Situation_Update_-_DEC7b.pdf",
+      "series_label": "WHO Emergency Situation Report #16",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2023-12-14",
+      "killed": 18787,
+      "injured": 50897,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_17_for_review.pdf",
+      "series_label": "WHO Emergency Situation Report #17",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2023-12-23",
+      "killed": 20057,
+      "injured": 53320,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_18b.pdf",
+      "series_label": "WHO Emergency Situation Report #18",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2023-12-29",
+      "killed": 21110,
+      "injured": 55243,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_19.pdf",
+      "series_label": "WHO Emergency Situation Report #19",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2024-01-11",
+      "killed": 23357,
+      "injured": 59410,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_20.pdf",
+      "series_label": "WHO Emergency Situation Report #20",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2024-01-22",
+      "killed": 25295,
+      "injured": 63000,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_21B.pdf",
+      "series_label": "WHO Emergency Situation Report #21",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-06-17",
+      "killed": 55432,
+      "injured": 128923,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_60_GS2.pdf",
+      "series_label": "WHO Emergency Situation Report #60",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-06-30",
+      "killed": 56531,
+      "injured": 133642,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_61.pdf",
+      "series_label": "WHO Emergency Situation Report #61",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-08-07",
+      "killed": 61258,
+      "injured": 152045,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_62.pdf?ua=1",
+      "series_label": "WHO Emergency Situation Report #62",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-08-21",
+      "killed": 62192,
+      "injured": 157114,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_63.pdf",
+      "series_label": "WHO Emergency Situation Report #63",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-09-10",
+      "killed": 64718,
+      "injured": 163859,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_64.pdf",
+      "series_label": "WHO Emergency Situation Report #64",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-09-28",
+      "killed": 66005,
+      "injured": 168162,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_65.pdf",
+      "series_label": "WHO Emergency Situation Report #65",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2025-10-31",
+      "killed": 68858,
+      "injured": 170664,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/sitrep66.pdf",
+      "series_label": "WHO Emergency Situation Report #66",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2026-01-31",
+      "killed": 71795,
+      "injured": 171551,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_67a_January_2026.pdf",
+      "series_label": "WHO Emergency Situation Report #67",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2026-03-31",
+      "killed": 72289,
+      "injured": 172040,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_68.pdf",
+      "series_label": "WHO Emergency Situation Report #68",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
+    },
+    {
+      "date": "2026-05-31",
+      "killed": 72941,
+      "injured": 172967,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sitrep_70b_latest_1.pdf",
+      "series_label": "WHO Emergency Situation Report #70",
+      "source_type": "WHO EMRO",
+      "parser_version": 9
     }
   ]
 }
