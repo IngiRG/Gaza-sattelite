@@ -2,7 +2,7 @@
   "source": "Tech for Palestine Daily Casualties - Gaza",
   "source_url": "https://data.techforpalestine.org/api/v2/casualties_daily.min.json",
   "documentation_url": "https://data.techforpalestine.org/docs/casualties-daily/",
-  "updated_at": "2026-08-08T10:49:16.281400+00:00",
+  "updated_at": "2026-08-08T13:17:11.682388+00:00",
   "records": [
     {
       "date": "2023-10-07",
@@ -16560,6 +16560,38 @@
       "women_reported": false,
       "report_source": "mohtel",
       "report_period": 24,
+      "source_url": "https://data.techforpalestine.org/docs/casualties-daily/",
+      "series_label": "Tech for Palestine Daily Casualties",
+      "source_type": "Tech for Palestine"
+    },
+    {
+      "date": "2026-08-07",
+      "killed": 73382,
+      "injured": 174236,
+      "children_killed": 20179,
+      "women_killed": 12500,
+      "killed_reported": false,
+      "injured_reported": false,
+      "children_reported": false,
+      "women_reported": false,
+      "report_source": "missing",
+      "report_period": 0,
+      "source_url": "https://data.techforpalestine.org/docs/casualties-daily/",
+      "series_label": "Tech for Palestine Daily Casualties",
+      "source_type": "Tech for Palestine"
+    },
+    {
+      "date": "2026-08-08",
+      "killed": 73384,
+      "injured": 174242,
+      "children_killed": 20179,
+      "women_killed": 12500,
+      "killed_reported": true,
+      "injured_reported": true,
+      "children_reported": false,
+      "women_reported": false,
+      "report_source": "mohtel",
+      "report_period": 48,
       "source_url": "https://data.techforpalestine.org/docs/casualties-daily/",
       "series_label": "Tech for Palestine Daily Casualties",
       "source_type": "Tech for Palestine"
