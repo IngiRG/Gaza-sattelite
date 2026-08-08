@@ -1,4 +1,4 @@
-name: Update Gaza casualty dataset
+name: Update Tech for Palestine datasets
 
 on:
   workflow_dispatch:
@@ -14,15 +14,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Download and normalize Tech for Palestine casualty data
+      - name: Download and normalize datasets
         shell: bash
         run: |
           python - <<'PY'
@@ -31,28 +29,22 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          API = "https://data.techforpalestine.org/api/v2/casualties_daily.min.json"
-          DOCS = "https://data.techforpalestine.org/docs/casualties-daily/"
-          OUT = Path("data/casualty-timeline.json")
+          CAS_API = "https://data.techforpalestine.org/api/v2/casualties_daily.min.json"
+          INFRA_API = "https://data.techforpalestine.org/api/v3/infrastructure-damaged.min.json"
 
-          req = urllib.request.Request(
-              API,
-              headers={
-                  "User-Agent": "DestructionVisualized/1.0",
-                  "Accept": "application/json",
-              },
-          )
+          CAS_DOCS = "https://data.techforpalestine.org/docs/casualties-daily/"
+          INFRA_DOCS = "https://data.techforpalestine.org/docs/infrastructure-damaged/"
 
-          with urllib.request.urlopen(req, timeout=60) as response:
-              source = json.load(response)
-
-          if not isinstance(source, list) or len(source) < 100:
-              raise RuntimeError(
-                  f"Unexpected casualty API response: {type(source)} / "
-                  f"{len(source) if isinstance(source, list) else 'not-list'}"
+          def fetch(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "DestructionVisualized/1.0",
+                      "Accept": "application/json",
+                  },
               )
-
-          records = []
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
 
           def integer(value):
               if value is None:
@@ -62,131 +54,187 @@ jobs:
               except (TypeError, ValueError):
                   return None
 
-          for raw in source:
+          def nested(row, group, field):
+              value = row.get(group)
+              if not isinstance(value, dict):
+                  return None
+              return integer(value.get(field))
+
+          # ---------------- Casualties ----------------
+          casualty_source = fetch(CAS_API)
+
+          if not isinstance(casualty_source, list) or len(casualty_source) < 100:
+              raise RuntimeError("Unexpected casualty API response")
+
+          casualty_records = []
+
+          for raw in casualty_source:
               date = raw.get("report_date")
               if not date:
                   continue
 
-              # Prefer explicitly reported cumulative values. The ext_ fields
-              # provide the project's continuous daily series when a value is
-              # absent. Keep flags so the frontend can distinguish them.
-              killed_reported = integer(raw.get("killed_cum"))
-              injured_reported = integer(raw.get("injured_cum"))
-              children_reported = integer(raw.get("killed_children_cum"))
-              women_reported = integer(raw.get("killed_women_cum"))
+              k_r = integer(raw.get("killed_cum"))
+              i_r = integer(raw.get("injured_cum"))
+              c_r = integer(raw.get("killed_children_cum"))
+              w_r = integer(raw.get("killed_women_cum"))
 
-              killed = (
-                  killed_reported
-                  if killed_reported is not None
-                  else integer(raw.get("ext_killed_cum"))
-              )
-              injured = (
-                  injured_reported
-                  if injured_reported is not None
-                  else integer(raw.get("ext_injured_cum"))
-              )
-              children = (
-                  children_reported
-                  if children_reported is not None
-                  else integer(raw.get("ext_killed_children_cum"))
-              )
-              women = (
-                  women_reported
-                  if women_reported is not None
-                  else integer(raw.get("ext_killed_women_cum"))
-              )
+              killed = k_r if k_r is not None else integer(raw.get("ext_killed_cum"))
+              injured = i_r if i_r is not None else integer(raw.get("ext_injured_cum"))
+              children = c_r if c_r is not None else integer(raw.get("ext_killed_children_cum"))
+              women = w_r if w_r is not None else integer(raw.get("ext_killed_women_cum"))
 
               if killed is None or injured is None:
                   continue
 
-              records.append({
+              casualty_records.append({
                   "date": date,
                   "killed": killed,
                   "injured": injured,
                   "children_killed": children,
                   "women_killed": women,
-
-                  "killed_reported": killed_reported is not None,
-                  "injured_reported": injured_reported is not None,
-                  "children_reported": children_reported is not None,
-                  "women_reported": women_reported is not None,
-
-                  "daily_killed": integer(raw.get("killed")),
-                  "daily_injured": integer(raw.get("injured")),
-                  "ext_daily_killed": integer(raw.get("ext_killed")),
-                  "ext_daily_injured": integer(raw.get("ext_injured")),
-
+                  "killed_reported": k_r is not None,
+                  "injured_reported": i_r is not None,
+                  "children_reported": c_r is not None,
+                  "women_reported": w_r is not None,
                   "report_source": raw.get("report_source", "missing"),
                   "report_period": raw.get("report_period"),
-                  "source_url": DOCS,
+                  "source_url": CAS_DOCS,
                   "series_label": "Tech for Palestine Daily Casualties",
                   "source_type": "Tech for Palestine",
               })
 
-          records.sort(key=lambda row: row["date"])
+          casualty_records.sort(key=lambda r: r["date"])
 
-          if len(records) < 100:
-              raise RuntimeError(
-                  f"Only {len(records)} usable records were produced; refusing to publish."
-              )
+          # ---------------- Infrastructure ----------------
+          infrastructure_source = fetch(INFRA_API)
 
-          # Basic integrity checks. We do not alter the source values.
-          for row in records:
-              if row["killed"] < 0 or row["injured"] < 0:
-                  raise RuntimeError(f"Negative casualty total on {row['date']}")
-              if row["injured"] < row["killed"]:
-                  # Do not fail on this assumption globally: just sanity-log it.
-                  print(
-                      "WARNING injured total below killed total:",
-                      row["date"],
-                      row["killed"],
-                      row["injured"],
+          if not isinstance(infrastructure_source, list) or len(infrastructure_source) < 20:
+              raise RuntimeError("Unexpected infrastructure API response")
+
+          infrastructure_records = []
+
+          for raw in infrastructure_source:
+              date = raw.get("report_date")
+              if not date:
+                  continue
+
+              civic_r = nested(raw, "civic_buildings", "destroyed")
+              civic_ext = nested(raw, "civic_buildings", "ext_destroyed")
+
+              edu_d_r = nested(raw, "educational_buildings", "destroyed")
+              edu_d_ext = nested(raw, "educational_buildings", "ext_destroyed")
+              edu_x_r = nested(raw, "educational_buildings", "damaged")
+              edu_x_ext = nested(raw, "educational_buildings", "ext_damaged")
+
+              mosque_d_r = nested(raw, "places_of_worship", "mosques_destroyed")
+              mosque_d_ext = nested(raw, "places_of_worship", "ext_mosques_destroyed")
+              mosque_x_r = nested(raw, "places_of_worship", "mosques_damaged")
+              mosque_x_ext = nested(raw, "places_of_worship", "ext_mosques_damaged")
+              church_r = nested(raw, "places_of_worship", "churches_destroyed")
+              church_ext = nested(raw, "places_of_worship", "ext_churches_destroyed")
+
+              residential_r = nested(raw, "residential", "destroyed")
+              residential_ext = nested(raw, "residential", "ext_destroyed")
+
+              infrastructure_records.append({
+                  "date": date,
+
+                  "residential_destroyed": residential_r if residential_r is not None else residential_ext,
+                  "residential_reported": residential_r is not None,
+
+                  "educational_destroyed": edu_d_r if edu_d_r is not None else edu_d_ext,
+                  "educational_destroyed_reported": edu_d_r is not None,
+
+                  "educational_damaged": edu_x_r if edu_x_r is not None else edu_x_ext,
+                  "educational_damaged_reported": edu_x_r is not None,
+
+                  "civic_destroyed": civic_r if civic_r is not None else civic_ext,
+                  "civic_reported": civic_r is not None,
+
+                  "mosques_destroyed": mosque_d_r if mosque_d_r is not None else mosque_d_ext,
+                  "mosques_destroyed_reported": mosque_d_r is not None,
+
+                  "mosques_damaged": mosque_x_r if mosque_x_r is not None else mosque_x_ext,
+                  "mosques_damaged_reported": mosque_x_r is not None,
+
+                  "churches_destroyed": church_r if church_r is not None else church_ext,
+                  "churches_reported": church_r is not None,
+
+                  "source_url": INFRA_DOCS,
+                  "series_label": "Tech for Palestine Infrastructure Damaged",
+                  "source_type": "Tech for Palestine",
+              })
+
+          infrastructure_records.sort(key=lambda r: r["date"])
+
+          # Require at least one usable infrastructure metric.
+          infrastructure_records = [
+              r for r in infrastructure_records
+              if any(
+                  r[k] is not None
+                  for k in (
+                      "residential_destroyed",
+                      "educational_destroyed",
+                      "educational_damaged",
+                      "civic_destroyed",
+                      "mosques_destroyed",
+                      "mosques_damaged",
+                      "churches_destroyed",
                   )
+              )
+          ]
 
-          OUT.parent.mkdir(parents=True, exist_ok=True)
+          if len(casualty_records) < 100:
+              raise RuntimeError(f"Only {len(casualty_records)} casualty records produced")
 
-          payload = {
-              "source": "Tech for Palestine Daily Casualties - Gaza",
-              "source_url": API,
-              "documentation_url": DOCS,
-              "updated_at": datetime.now(timezone.utc).isoformat(),
-              "method": (
-                  "Daily Gaza casualty data downloaded from the Tech for Palestine "
-                  "v2 casualties_daily API. Explicit cumulative values are preferred. "
-                  "When a field is absent, the corresponding ext_ field supplied by "
-                  "the dataset is used for continuity; reported/extrapolated flags are "
-                  "retained for the frontend."
-              ),
-              "records": records,
-          }
+          if len(infrastructure_records) < 20:
+              raise RuntimeError(f"Only {len(infrastructure_records)} infrastructure records produced")
 
-          OUT.write_text(
-              json.dumps(payload, indent=2, ensure_ascii=False),
+          Path("data").mkdir(parents=True, exist_ok=True)
+
+          Path("data/casualty-timeline.json").write_text(
+              json.dumps({
+                  "source": "Tech for Palestine Daily Casualties - Gaza",
+                  "source_url": CAS_API,
+                  "documentation_url": CAS_DOCS,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "records": casualty_records,
+              }, indent=2, ensure_ascii=False),
+              encoding="utf-8",
+          )
+
+          Path("data/infrastructure-timeline.json").write_text(
+              json.dumps({
+                  "source": "Tech for Palestine Infrastructure Damaged",
+                  "source_url": INFRA_API,
+                  "documentation_url": INFRA_DOCS,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "method": (
+                      "Explicit reported fields are preferred. If an explicit field "
+                      "is absent, the corresponding ext_ field supplied by Tech for "
+                      "Palestine is used. Reported flags are retained so the frontend "
+                      "can distinguish actual observations from continuous values."
+                  ),
+                  "records": infrastructure_records,
+              }, indent=2, ensure_ascii=False),
               encoding="utf-8",
           )
 
           print(
-              f"SUCCESS: {len(records)} daily records, "
-              f"{records[0]['date']} through {records[-1]['date']}"
+              f"Casualties: {len(casualty_records)} records, "
+              f"{casualty_records[0]['date']} to {casualty_records[-1]['date']}"
           )
           print(
-              "Latest:",
-              records[-1]["killed"],
-              "killed;",
-              records[-1]["injured"],
-              "injured;",
-              records[-1]["children_killed"],
-              "children killed;",
-              records[-1]["women_killed"],
-              "women killed",
+              f"Infrastructure: {len(infrastructure_records)} records, "
+              f"{infrastructure_records[0]['date']} to {infrastructure_records[-1]['date']}"
           )
           PY
 
-      - name: Commit casualty timeline
+      - name: Commit datasets
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/casualty-timeline.json
+          git add data/casualty-timeline.json data/infrastructure-timeline.json
           git diff --cached --quiet && exit 0
-          git commit -m "Update Gaza casualty timeline"
+          git commit -m "Update Tech for Palestine datasets"
           git push
