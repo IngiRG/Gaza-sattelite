@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y poppler-utils
-          pip install requests beautifulsoup4 pdfplumber
+          pip install requests beautifulsoup4 pdfplumber pymupdf
 
       - name: Build WHO casualty timeline
         shell: bash
@@ -40,10 +40,11 @@ jobs:
 
           import requests
           import pdfplumber
+          import fitz
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 21
+          VERSION = 22
 
           ARCHIVES = [
               # Canonical WHO Gaza Emergency Situation Reports archive.
@@ -1380,6 +1381,399 @@ jobs:
               ]
 
           # -----------------------------------------------------------------
+          # MULTI-ENGINE PDF RECONSTRUCTION
+          # -----------------------------------------------------------------
+
+          def pymupdf_pages(pdf_bytes):
+              """
+              Second spatial extraction engine.
+
+              PyMuPDF often reconstructs WHO card/table text differently from
+              pdfplumber, which helps when one engine splits numbers or labels.
+              """
+              output = []
+
+              doc = fitz.open(
+                  stream=pdf_bytes,
+                  filetype="pdf",
+              )
+
+              try:
+                  for page_index in range(
+                      len(doc)
+                  ):
+                      page = doc[
+                          page_index
+                      ]
+
+                      raw_words = page.get_text(
+                          "words"
+                      )
+
+                      words = []
+
+                      for item in raw_words:
+                          # x0, y0, x1, y1, text, block, line, word
+                          if len(item) < 5:
+                              continue
+
+                          x0, y0, x1, y1, token = item[:5]
+
+                          words.append({
+                              "text": str(token),
+                              "x0": float(x0),
+                              "x1": float(x1),
+                              "top": float(y0),
+                              "bottom": float(y1),
+                          })
+
+                      output.append({
+                          "page": page_index + 1,
+                          "width": float(
+                              page.rect.width
+                          ),
+                          "height": float(
+                              page.rect.height
+                          ),
+                          "words": words,
+                      })
+
+              finally:
+                  doc.close()
+
+              return output
+
+          def reconstruct_numeric_tokens(words):
+              """
+              Reconstruct numbers that PDF engines split into pieces, e.g.
+              '31' ',' '272' or '31,' '272'.
+
+              Existing complete numeric tokens are retained.
+              """
+              enriched = []
+
+              for word in words:
+                  copy = dict(word)
+                  enriched.append(copy)
+
+              # Work by visual line.
+              rows = {}
+
+              for word in words:
+                  key = round(
+                      float(
+                          word.get(
+                              "top",
+                              0,
+                          )
+                      ) / 4
+                  )
+
+                  rows.setdefault(
+                      key,
+                      [],
+                  ).append(word)
+
+              reconstructed = []
+
+              for row_words in rows.values():
+                  ws = sorted(
+                      row_words,
+                      key=lambda w: float(
+                          w.get(
+                              "x0",
+                              0,
+                          )
+                      ),
+                  )
+
+                  for start in range(
+                      len(ws)
+                  ):
+                      combined = ""
+                      x0 = float(
+                          ws[start].get(
+                              "x0",
+                              0,
+                          )
+                      )
+                      top = float(
+                          ws[start].get(
+                              "top",
+                              0,
+                          )
+                      )
+                      bottom = float(
+                          ws[start].get(
+                              "bottom",
+                              0,
+                          )
+                      )
+                      last_x1 = x0
+
+                      for end in range(
+                          start,
+                          min(
+                              len(ws),
+                              start + 5,
+                          ),
+                      ):
+                          w = ws[end]
+                          token = str(
+                              w.get(
+                                  "text",
+                                  "",
+                              )
+                          ).strip()
+
+                          # Only numeric punctuation pieces can participate.
+                          if not re.fullmatch(
+                              r"[\d,\s]+",
+                              token,
+                          ):
+                              break
+
+                          wx0 = float(
+                              w.get(
+                                  "x0",
+                                  0,
+                              )
+                          )
+
+                          if (
+                              end > start
+                              and wx0
+                              - last_x1
+                              > 12
+                          ):
+                              break
+
+                          combined += token
+
+                          x1 = float(
+                              w.get(
+                                  "x1",
+                                  wx0,
+                              )
+                          )
+
+                          bottom = max(
+                              bottom,
+                              float(
+                                  w.get(
+                                      "bottom",
+                                      bottom,
+                                  )
+                              ),
+                          )
+
+                          last_x1 = x1
+
+                          normalized = re.sub(
+                              r"[\s,]",
+                              "",
+                              combined,
+                          )
+
+                          if re.fullmatch(
+                              r"\d{3,6}",
+                              normalized,
+                          ):
+                              reconstructed.append({
+                                  "text": combined,
+                                  "x0": x0,
+                                  "x1": x1,
+                                  "top": top,
+                                  "bottom": bottom,
+                              })
+
+              # Add reconstructed tokens and dedupe by geometry/text.
+              seen = set()
+
+              for word in enriched + reconstructed:
+                  key = (
+                      str(
+                          word.get(
+                              "text",
+                              "",
+                          )
+                      ),
+                      round(
+                          float(
+                              word.get(
+                                  "x0",
+                                  0,
+                              )
+                          ),
+                          1,
+                      ),
+                      round(
+                          float(
+                              word.get(
+                                  "top",
+                                  0,
+                              )
+                          ),
+                          1,
+                      ),
+                  )
+
+                  if key in seen:
+                      continue
+
+                  seen.add(key)
+                  yield word
+
+          def reconstruct_label_lines(lines):
+              """
+              Merge adjacent visual lines so labels broken across rows such as
+
+                  Number of people
+                  killed in Gaza
+
+              can be recognized semantically.
+              """
+              output = list(lines)
+
+              for i in range(
+                  len(lines)
+              ):
+                  for width in (
+                      2,
+                      3,
+                  ):
+                      if (
+                          i + width
+                          > len(lines)
+                      ):
+                          continue
+
+                      group = lines[
+                          i:i + width
+                      ]
+
+                      # Require vertical adjacency.
+                      okay = True
+
+                      for a, b in zip(
+                          group,
+                          group[1:],
+                      ):
+                          if (
+                              b["top"]
+                              - a["bottom"]
+                              > 26
+                          ):
+                              okay = False
+                              break
+
+                      if not okay:
+                          continue
+
+                      output.append({
+                          "text": clean(
+                              " ".join(
+                                  row["text"]
+                                  for row in group
+                              )
+                          ),
+                          "top": min(
+                              row["top"]
+                              for row in group
+                          ),
+                          "bottom": max(
+                              row["bottom"]
+                              for row in group
+                          ),
+                          "x0": min(
+                              row["x0"]
+                              for row in group
+                          ),
+                          "x1": max(
+                              row["x1"]
+                              for row in group
+                          ),
+                          "words": [
+                              word
+                              for row in group
+                              for word in row["words"]
+                          ],
+                      })
+
+              return output
+
+          def prepare_engine_page(
+              page_info,
+              engine,
+          ):
+              words = list(
+                  reconstruct_numeric_tokens(
+                      page_info[
+                          "words"
+                      ]
+                  )
+              )
+
+              lines = line_groups(
+                  words
+              )
+
+              lines = reconstruct_label_lines(
+                  lines
+              )
+
+              return {
+                  "engine": engine,
+                  "page": page_info["page"],
+                  "width": page_info.get(
+                      "width",
+                      0,
+                  ),
+                  "height": page_info.get(
+                      "height",
+                      0,
+                  ),
+                  "words": words,
+                  "lines": lines,
+              }
+
+          def all_engine_pages(
+              pdf_bytes
+          ):
+              """
+              Return each PDF page from both spatial engines.
+              """
+              output = []
+
+              for info in spatial_pages(
+                  pdf_bytes
+              ):
+                  output.append(
+                      prepare_engine_page(
+                          info,
+                          "pdfplumber",
+                      )
+                  )
+
+              try:
+                  for info in pymupdf_pages(
+                      pdf_bytes
+                  ):
+                      output.append(
+                          prepare_engine_page(
+                              info,
+                              "pymupdf",
+                          )
+                      )
+              except Exception as error:
+                  print(
+                      "PyMuPDF extraction failed:",
+                      error,
+                  )
+
+              return output
+
+          # -----------------------------------------------------------------
           # WHOLE GAZA-SECTION PARSER
           # -----------------------------------------------------------------
 
@@ -1453,26 +1847,86 @@ jobs:
 
           def numbers_in_section(section):
               """
-              Return all plausible casualty-scale numbers found in a Gaza
-              section, preserving visual order.
+              Return plausible casualty-scale numbers inside a Gaza section.
+              Reconstructed numeric tokens are already present in line words.
               """
               output = []
+              seen = set()
 
               for line in section:
                   for word in line["words"]:
                       value = word_number(
-                          str(word.get("text", ""))
+                          str(
+                              word.get(
+                                  "text",
+                                  "",
+                              )
+                          )
                       )
+
+                      if value is None:
+                          # Reconstructed values may retain commas/spaces.
+                          raw = re.sub(
+                              r"[\s,]",
+                              "",
+                              str(
+                                  word.get(
+                                      "text",
+                                      "",
+                                  )
+                              ),
+                          )
+
+                          if re.fullmatch(
+                              r"\d{3,6}",
+                              raw,
+                          ):
+                              value = int(
+                                  raw
+                              )
 
                       if value is None:
                           continue
 
-                      if 100 <= value <= 1000000:
-                          output.append({
-                              "value": value,
-                              "line": line,
-                              "word": word,
-                          })
+                      if not (
+                          100
+                          <= value
+                          <= 1000000
+                      ):
+                          continue
+
+                      key = (
+                          value,
+                          round(
+                              float(
+                                  word.get(
+                                      "x0",
+                                      0,
+                                  )
+                              ),
+                              1,
+                          ),
+                          round(
+                              float(
+                                  word.get(
+                                      "top",
+                                      0,
+                                  )
+                              ),
+                              1,
+                          ),
+                      )
+
+                      if key in seen:
+                          continue
+
+                      seen.add(key)
+
+                      output.append({
+                          "value": value,
+                          "line": line,
+                          "word": word,
+                      })
 
               return output
 
@@ -1727,35 +2181,33 @@ jobs:
 
           def spatial_parse(pdf_bytes):
               """
-              Scan every page independently.
+              Multi-engine semantic parser.
 
-              Primary method:
-              - isolate the whole Gaza section
-              - find killed/fatalities/deaths and injured/injuries/wounded
-                anywhere within that section
-              - associate each concept with the strongest plausible number
+              pdfplumber and PyMuPDF independently reconstruct each page.
+              The whole Gaza section parser is primary. Local semantic and
+              exact-card parsers are fallbacks.
 
-              Secondary methods:
-              - local generic semantic parser
-              - exact legacy Gaza labels/cards
+              If both engines agree on a pair, confidence is highest.
+              A pair found by one engine may still be accepted if no competing
+              plausible pair exists.
               """
-              output = {}
+              pair_support = {}
 
-              for page_info in spatial_pages(
+              for page_info in all_engine_pages(
                   pdf_bytes
               ):
-                  words = page_info["words"]
+                  words = page_info[
+                      "words"
+                  ]
+                  lines = page_info[
+                      "lines"
+                  ]
 
                   if not words:
                       continue
 
-                  lines = line_groups(
-                      words
-                  )
-
                   candidates = []
 
-                  # Main section-based parser.
                   candidates.extend(
                       semantic_gaza_section_pairs(
                           words,
@@ -1763,8 +2215,6 @@ jobs:
                       )
                   )
 
-                  # If section parser does not resolve a pair, try local
-                  # semantic proximity.
                   if not candidates:
                       candidates.extend(
                           semantic_page_pairs(
@@ -1773,7 +2223,6 @@ jobs:
                           )
                       )
 
-                  # Final conservative legacy fallback.
                   if not candidates:
                       candidates.extend(
                           spatial_early_labels(
@@ -1789,17 +2238,132 @@ jobs:
                       )
 
                   for killed, injured, method in candidates:
-                      output.setdefault(
-                          (
-                              killed,
-                              injured,
-                          ),
-                          set(),
-                      ).add(
-                          f"{method}:page{page_info['page']}"
+                      key = (
+                          killed,
+                          injured,
                       )
 
-              return output
+                      pair_support.setdefault(
+                          key,
+                          {
+                              "methods": set(),
+                              "engines": set(),
+                              "pages": set(),
+                          },
+                      )
+
+                      pair_support[
+                          key
+                      ]["methods"].add(
+                          method
+                      )
+                      pair_support[
+                          key
+                      ]["engines"].add(
+                          page_info[
+                              "engine"
+                          ]
+                      )
+                      pair_support[
+                          key
+                      ]["pages"].add(
+                          page_info[
+                              "page"
+                          ]
+                      )
+
+              if not pair_support:
+                  return {}
+
+              ranked = []
+
+              for pair, info in pair_support.items():
+                  score = 0
+
+                  # Independent engine agreement is the strongest signal.
+                  score += (
+                      len(
+                          info[
+                              "engines"
+                          ]
+                      )
+                      * 100
+                  )
+
+                  score += (
+                      len(
+                          info[
+                              "methods"
+                          ]
+                      )
+                      * 20
+                  )
+
+                  score += min(
+                      20,
+                      len(
+                          info[
+                              "pages"
+                          ]
+                      )
+                      * 5,
+                  )
+
+                  ranked.append(
+                      (
+                          score,
+                          pair,
+                          info,
+                      )
+                  )
+
+              ranked.sort(
+                  key=lambda item: item[0],
+                  reverse=True,
+              )
+
+              best_score, best_pair, best_info = ranked[0]
+
+              # A differently-valued pair with nearly equal evidence is
+              # ambiguous and must not be accepted.
+              if len(ranked) > 1:
+                  second_score, second_pair, _ = ranked[1]
+
+                  if (
+                      second_pair
+                      != best_pair
+                      and best_score
+                      - second_score
+                      < 35
+                  ):
+                      return {}
+
+              killed, injured = best_pair
+
+              methods = set()
+
+              for method in best_info[
+                  "methods"
+              ]:
+                  methods.add(
+                      "multi-engine:"
+                      + method
+                  )
+
+              for engine in best_info[
+                  "engines"
+              ]:
+                  methods.add(
+                      "engine:"
+                      + engine
+                  )
+
+              return {
+                  (
+                      killed,
+                      injured,
+                  ): methods
+              }
 
 
           def parse_issue(meta):
@@ -1944,8 +2508,24 @@ jobs:
               }
 
           def validate(rows):
+              """
+              Validate WHO cumulative series without modifying any source value.
+
+              Chronology is rejection-only:
+              - totals must not decrease
+              - extreme jumps are rejected
+              - no interpolation or correction is ever performed
+              """
               rows.sort(
-                  key=lambda row: row["issue"]
+                  key=lambda row: (
+                      row["date"],
+                      int(
+                          row.get(
+                              "issue",
+                              9999,
+                          )
+                      ),
+                  )
               )
 
               final = []
@@ -1954,8 +2534,6 @@ jobs:
                   if final:
                       previous = final[-1]
 
-                      # WHO/MoH cumulative figures should not go backwards.
-                      # Never correct a source value automatically.
                       if (
                           row["killed"]
                           < previous["killed"]
@@ -1964,13 +2542,52 @@ jobs:
                       ):
                           print(
                               "DECREASING TOTAL OMITTED:",
-                              row["issue"],
+                              row.get("issue"),
                               row["killed"],
                               row["injured"],
                           )
                           continue
 
-                  final.append(row)
+                      try:
+                          d1 = datetime.fromisoformat(
+                              previous["date"]
+                          ).date()
+                          d2 = datetime.fromisoformat(
+                              row["date"]
+                          ).date()
+                          delta_days = max(
+                              1,
+                              (d2 - d1).days,
+                          )
+                      except Exception:
+                          delta_days = 1
+
+                      killed_rate = (
+                          row["killed"]
+                          - previous["killed"]
+                      ) / delta_days
+
+                      injured_rate = (
+                          row["injured"]
+                          - previous["injured"]
+                      ) / delta_days
+
+                      # Deliberately generous parser-error guard.
+                      if (
+                          killed_rate > 5000
+                          or injured_rate > 15000
+                      ):
+                          print(
+                              "IMPLAUSIBLE JUMP OMITTED:",
+                              row.get("issue"),
+                              row["killed"],
+                              row["injured"],
+                          )
+                          continue
+
+                  final.append(
+                      row
+                  )
 
               return final
 
@@ -2150,17 +2767,18 @@ jobs:
                   ),
                   "method": (
                       "Issue number and date come from WHO's official "
-                      "Emergency Situation Reports archive. Every PDF page is "
-                      "split into visual sections, and the full Gaza section is "
-                      "isolated before casualty extraction. Within that section, "
-                      "labels such as killed, fatalities, deaths, injured, "
-                      "injuries, or wounded may be separated from their numbers "
-                      "by multiple lines; candidates are ranked by visual relation "
-                      "within the same Gaza section. Ministry of Health attribution "
-                      "strengthens confidence. Local proximity and older exact-card "
-                      "rules are fallback only. Previously verified WHO-only records "
-                      "are preserved. No OCR, interpolation, OCHA fallback, or "
-                      "inferred totals."
+                      "Emergency Situation Reports archive. Every PDF is parsed "
+                      "independently with pdfplumber and PyMuPDF, plus strict "
+                      "pdftotext fallback. Broken numeric tokens and multi-line "
+                      "casualty labels are reconstructed before the full Gaza "
+                      "section is isolated. Killed/fatalities/deaths and "
+                      "injured/injuries/wounded are then paired within that Gaza "
+                      "section. Independent engine agreement increases confidence; "
+                      "competing plausible pairs are rejected. Chronology is used "
+                      "only to reject decreases or obviously impossible parser "
+                      "jumps and never to invent or alter values. Previously "
+                      "verified WHO-only records are preserved. No OCR, "
+                      "interpolation, OCHA fallback, or inferred totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
