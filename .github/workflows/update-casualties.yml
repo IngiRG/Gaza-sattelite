@@ -1,4 +1,4 @@
-name: Update Gaza casualty timeline from Ministry of Health
+name: Update Gaza casualty timeline from WHO
 
 on:
   workflow_dispatch:
@@ -20,526 +20,1190 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install updater
-        run: pip install requests beautifulsoup4
+      - name: Install parser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+          pip install requests beautifulsoup4 pdfplumber
 
-      - name: Build casualty timeline from Gaza Ministry of Health
+      - name: Build WHO casualty timeline
         shell: bash
         run: |
-          cat > /tmp/update_moh.py <<'PY'
+          cat > /tmp/update_who.py <<'PY'
           from pathlib import Path
-          from datetime import datetime, timezone, date
+          from datetime import datetime, timezone
           from urllib.parse import urljoin
-          from concurrent.futures import ThreadPoolExecutor, as_completed
           import json
           import re
-          import time
+          import subprocess
+          import tempfile
 
           import requests
+          import pdfplumber
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          BASE = "https://www.moh.gov.ps/portal/"
-          VERSION = 16
-          START = date(2023, 10, 8)
+          VERSION = 17
+
+          ARCHIVES = [
+              # Canonical WHO Gaza Emergency Situation Reports archive.
+              "https://www.emro.who.int/opt/information-resources/emergency-situation-reports.html",
+          ]
+
+          # WHO's archive currently resolves Issue 68 to the wrong PDF on
+          # some mirrors. This is the official WHO EMRO Issue 68 PDF.
+          DIRECT_ISSUE_URLS = {
+              68: "https://www.emro.who.int/images/stories/palestine/Sitrep_68.pdf",
+          }
+
+          VERIFIED_ISSUE_DATES = {
+              # WHO canonical archive: Issue 68, 31 March 2026.
+              68: "2026-03-31",
+          }
 
           session = requests.Session()
           session.headers.update({
-              "User-Agent": "DestructionVisualized-MoH-CasualtyTimeline/16.0",
-              "Accept-Language": "ar,en;q=0.9",
+              "User-Agent": "DestructionVisualized-WHO-CasualtyTimeline/10.0",
+              "Accept-Language": "en",
           })
 
-          # Public Ministry archive/category pages. The English category is
-          # useful for early-war translated statements; the main archive
-          # provides the Arabic material and newer releases.
-          LISTINGS = [
-              BASE + "archive/",
-              BASE + "category/english/",
-              BASE + "en/",
-          ]
+          ISSUE_LABEL = re.compile(
+              r"\bIssue\s+(\d+)\s*,?\s*"
+              r"(\d{1,2}\s+"
+              r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+              r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+              r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+              r"\s+20\d{2})",
+              re.I,
+          )
 
-          ARABIC_DIGITS = str.maketrans({
-              "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-              "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
-              "٬": ",", "،": ",",
-          })
+          PDF_ISSUE = re.compile(
+              r"\bIssue\s*#?\s*(\d+)\b",
+              re.I,
+          )
 
-          NUM = r"\d{1,3}(?:,\d{3})+|\d{3,6}"
+          NUM = r"\d{1,3}(?:[,\s]\d{3})+|\d{3,6}"
 
-          EN_PATTERNS = [
-              # "2,215 Palestinians killed ... and 8,714 citizens were injured"
-              re.compile(
-                  rf"(?P<k>{NUM})\s+Palestinians?\s+"
-                  rf"(?:have\s+been\s+|were\s+|confirmed\s+)?killed"
-                  rf".{{0,260}}?(?P<i>{NUM})\s+"
-                  rf"(?:Palestinians?|citizens|people|others)?\s*"
-                  rf"(?:have\s+been\s+|were\s+|are\s+)?injured",
-                  re.I | re.S,
-              ),
+          def clean(value):
+              return re.sub(r"\s+", " ", value or "").strip()
 
-              # "death toll ... increased to 3,785 deaths ... injuring 12,493"
-              re.compile(
-                  rf"(?:death\s+toll|total\s+number\s+of\s+(?:martyrs|deaths)|"
-                  rf"casualt(?:y|ies)\s+toll)"
-                  rf".{{0,140}}?(?P<k>{NUM})"
-                  rf".{{0,320}}?(?:injur(?:ed|ies|ing)|wounded)"
-                  rf".{{0,90}}?(?P<i>{NUM})",
-                  re.I | re.S,
-              ),
+          def n(raw):
+              return int(re.sub(r"[\s,]", "", raw))
 
-              # "total number of martyrs has reached 72,208, with 172,068 wounded"
-              re.compile(
-                  rf"(?:total\s+number\s+of\s+)?martyrs?"
-                  rf".{{0,100}}?(?:reached|is|stands?\s+at|to)?\s*"
-                  rf"(?P<k>{NUM})"
-                  rf".{{0,160}}?(?:with|and)\s+"
-                  rf"(?P<i>{NUM})\s+(?:wounded|injured)",
-                  re.I | re.S,
-              ),
-
-              # "61,258 fatalities and 152,045 injuries"
-              re.compile(
-                  rf"(?P<k>{NUM})\s+(?:deaths|fatalities|martyrs)"
-                  rf".{{0,120}}?(?:and|with)\s+"
-                  rf"(?P<i>{NUM})\s+(?:injuries|injured|wounded)",
-                  re.I | re.S,
-              ),
-          ]
-
-          AR_PATTERNS = [
-              # "ارتفعت حصيلة العدوان ... إلى 45,000 شهيد و 100,000 إصابة"
-              re.compile(
-                  rf"(?:ارتفعت|ارتفاع|بلغت|تبلغ|وصلت)\s+"
-                  rf"(?:حصيلة|الحصيلة)"
-                  rf".{{0,160}}?(?P<k>{NUM})\s+"
-                  rf"(?:شهيد|شهيداً|شهيدا|شهداء)"
-                  rf".{{0,160}}?(?P<i>{NUM})\s+"
-                  rf"(?:إصابة|اصابة|مصاب|جريح|جريحاً|جريحا)",
-                  re.S,
-              ),
-
-              # "حصيلة العدوان الإسرائيلي 45,000 شهيد و100,000 إصابة"
-              re.compile(
-                  rf"(?:حصيلة|الحصيلة)"
-                  rf".{{0,180}}?(?P<k>{NUM})\s+"
-                  rf"(?:شهيد|شهيداً|شهيدا|شهداء)"
-                  rf".{{0,180}}?(?P<i>{NUM})\s+"
-                  rf"(?:إصابة|اصابة|مصاب|جريح|جريحاً|جريحا)",
-                  re.S,
-              ),
-
-              # "إجمالي عدد الشهداء 45,000 ... إجمالي عدد الجرحى 100,000"
-              re.compile(
-                  rf"(?:إجمالي|اجمالي)\s+(?:عدد\s+)?(?:الشهداء|الوفيات)"
-                  rf".{{0,100}}?(?P<k>{NUM})"
-                  rf".{{0,260}}?(?:إجمالي|اجمالي)\s+(?:عدد\s+)?"
-                  rf"(?:الجرحى|المصابين|الإصابات|الاصابات)"
-                  rf".{{0,100}}?(?P<i>{NUM})",
-                  re.S,
-              ),
-
-              # "72,208 شهيد ... 172,068 جريح/إصابة"
-              re.compile(
-                  rf"(?P<k>{NUM})\s+"
-                  rf"(?:شهيد|شهيداً|شهيدا|شهداء)"
-                  rf".{{0,220}}?(?P<i>{NUM})\s+"
-                  rf"(?:إصابة|اصابة|مصاب|جريح|جريحاً|جريحا|الجرحى)",
-                  re.S,
-              ),
-          ]
-
-          def normalize(text):
-              text = (text or "").translate(ARABIC_DIGITS)
-              text = text.replace("\xa0", " ")
-              return re.sub(r"\s+", " ", text).strip()
-
-          def num(raw):
-              return int(raw.replace(",", ""))
-
-          def get(url, timeout=35):
+          def get(url, timeout=90):
               r = session.get(url, timeout=timeout)
-              if r.status_code == 404:
-                  return None
               r.raise_for_status()
               return r
 
-          def parse_date_from_page(soup, text):
-              for attrs in (
-                  {"property": "article:published_time"},
-                  {"name": "date"},
-                  {"name": "DC.date"},
+          def parse_label_date(raw):
+              raw = clean(raw)
+              for fmt in (
+                  "%d %B %Y",
+                  "%d %b %Y",
               ):
-                  tag = soup.find("meta", attrs=attrs)
-                  if tag and tag.get("content"):
-                      raw = tag["content"].strip()
-                      try:
-                          return datetime.fromisoformat(
-                              raw.replace("Z", "+00:00")
-                          ).date()
-                      except Exception:
-                          pass
-
-              # Site visibly prints dd/mm/yyyy on posts.
-              m = re.search(
-                  r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b",
-                  text[:1800],
-              )
-              if m:
-                  try:
-                      return date(
-                          int(m.group(3)),
-                          int(m.group(2)),
-                          int(m.group(1)),
-                      )
-                  except Exception:
-                      pass
-
-              # English month-name fallback.
-              m = re.search(
-                  r"\b(\d{1,2})\s+"
-                  r"(January|February|March|April|May|June|July|August|"
-                  r"September|October|November|December)\s+(20\d{2})\b",
-                  text[:1800],
-                  re.I,
-              )
-              if m:
                   try:
                       return datetime.strptime(
-                          " ".join(m.groups()),
-                          "%d %B %Y",
-                      ).date()
+                          raw,
+                          fmt,
+                      ).date().isoformat()
                   except Exception:
                       pass
-
               return None
 
-          def discover_posts():
-              found = {}
+          def discover():
+              """
+              The WHO archive is our source of truth for:
+              - issue number
+              - issue/report date
+              - PDF URL
 
-              for root in LISTINGS:
-                  empty = 0
+              We do NOT infer those values from arbitrary PDF body text.
+              """
+              issues = {}
 
-                  for page_num in range(1, 220):
-                      url = (
-                          root
-                          if page_num == 1
-                          else urljoin(root, f"page/{page_num}/")
+              for archive in ARCHIVES:
+                  try:
+                      soup = BeautifulSoup(
+                          get(archive).text,
+                          "html.parser",
+                      )
+                  except Exception as error:
+                      print("ARCHIVE FAILED", archive, error)
+                      continue
+
+                  links = soup.find_all("a", href=True)
+
+                  for a in links:
+                      label = clean(
+                          a.get_text(" ", strip=True)
+                      )
+                      match = ISSUE_LABEL.search(label)
+
+                      if not match:
+                          continue
+
+                      issue = int(match.group(1))
+                      report_date = parse_label_date(
+                          match.group(2)
                       )
 
-                      try:
-                          r = get(url)
-                      except Exception as error:
-                          print("LISTING FAILED", url, error)
-                          empty += 1
-                          if empty >= 5:
-                              break
+                      if not report_date:
                           continue
 
-                      if r is None:
-                          empty += 1
-                          if empty >= 3:
-                              break
-                          continue
+                      href = urljoin(
+                          archive,
+                          a["href"],
+                      )
 
-                      soup = BeautifulSoup(r.text, "html.parser")
-                      page_links = 0
+                      # Some archive links redirect to a PDF rather than
+                      # ending with .pdf, so do not require a .pdf suffix.
+                      current = issues.get(issue)
 
-                      for a in soup.find_all("a", href=True):
-                          href = urljoin(url, a["href"]).split("#", 1)[0]
+                      candidate = {
+                          "issue": issue,
+                          "date": VERIFIED_ISSUE_DATES.get(
+                              issue,
+                              report_date,
+                          ),
+                          "url": href,
+                          "archive_label": label,
+                      }
 
-                          if not href.startswith(BASE):
-                              continue
-
-                          # Exclude archive/category/navigation URLs.
-                          if any(
-                              token in href
-                              for token in (
-                                  "/category/",
-                                  "/tag/",
-                                  "/author/",
-                                  "/page/",
-                                  "/archive/",
-                                  "/en/",
-                                  "/wp-",
-                                  "?",
-                              )
-                          ):
-                              continue
-
-                          label = normalize(
-                              a.get_text(" ", strip=True)
-                          )
-
-                          # Individual WordPress posts have a trailing slash
-                          # and a non-empty slug under /portal/.
-                          tail = href[len(BASE):].strip("/")
-                          if not tail or "/" in tail:
-                              continue
-
-                          found[href] = label
-                          page_links += 1
-
-                      if page_links:
-                          empty = 0
-                      else:
-                          empty += 1
-
-                      if empty >= 5:
-                          break
-
-                      # Avoid hammering the Ministry site.
-                      time.sleep(0.06)
-
-              print("Discovered", len(found), "MoH post URLs")
-              return found
-
-          def full_war_context(text, published):
-              low = text.lower()
-
-              # Explicit full-war anchors in English.
-              english_anchor = any(
-                  phrase in low
-                  for phrase in (
-                      "since 7 october 2023",
-                      "since october 7 2023",
-                      "since the start of escalation",
-                      "since the start of the escalation",
-                      "since the beginning of the ongoing escalation",
-                      "since the start of hostilities",
-                  )
-              )
-
-              # Arabic full-war anchors.
-              arabic_anchor = any(
-                  phrase in text
-                  for phrase in (
-                      "منذ السابع من أكتوبر",
-                      "منذ 7 أكتوبر",
-                      "منذ السابع من اكتوبر",
-                      "منذ 7 اكتوبر",
-                      "منذ بدء العدوان",
-                      "منذ بداية العدوان",
-                      "منذ بدء الحرب",
-                      "منذ بداية الحرب",
-                      "منذ بدء التصعيد",
-                  )
-              )
-
-              # Explicit subset anchors make a statement ineligible unless
-              # the same page also clearly states the full-war baseline.
-              subset = any(
-                  phrase in low
-                  for phrase in (
-                      "since the ceasefire",
-                      "post-ceasefire",
-                      "since ceasefire",
-                  )
-              ) or any(
-                  phrase in text
-                  for phrase in (
-                      "منذ وقف إطلاق النار",
-                      "منذ وقف اطلاق النار",
-                      "منذ سريان وقف إطلاق النار",
-                      "منذ سريان الهدنة",
-                      "منذ الهدنة",
-                  )
-              )
-
-              if subset and not (english_anchor or arabic_anchor):
-                  return False
-
-              if english_anchor or arabic_anchor:
-                  return True
-
-              # In the first weeks after 7 Oct, official MoH updates often
-              # simply say "death toll" because the conflict had only just
-              # begun. Permit that narrow early period.
-              if published and published <= date(2023, 11, 30):
-                  return True
-
-              # Later pages without an explicit full-war anchor are accepted
-              # only if they use unambiguous TOTAL/cumulative language.
-              total_words = (
-                  "total number of martyrs" in low
-                  or "death toll" in low
-                  or "cumulative" in low
-                  or "إجمالي عدد الشهداء" in text
-                  or "اجمالي عدد الشهداء" in text
-                  or "حصيلة العدوان" in text
-                  or "الحصيلة" in text
-              )
-
-              return total_words
-
-          def extract_pairs(text):
-              pairs = []
-
-              for pattern in EN_PATTERNS + AR_PATTERNS:
-                  for m in pattern.finditer(text):
-                      k = num(m.group("k"))
-                      i = num(m.group("i"))
-
-                      if (
-                          100 <= k <= 500000
-                          and 100 <= i <= 1000000
-                          and i > k
+                      # Canonical archive metadata is authoritative.
+                      # We may improve only the URL, never the issue/date.
+                      if current is None:
+                          issues[issue] = candidate
+                      elif (
+                          ".pdf" in href.lower()
+                          and ".pdf" not in current["url"].lower()
                       ):
-                          pairs.append((k, i))
+                          current["url"] = href
 
-              return set(pairs)
-
-          def parse_post(url):
-              try:
-                  r = get(url)
-              except Exception as error:
-                  print("POST FAILED", url, error)
-                  return None
-
-              if r is None:
-                  return None
-
-              soup = BeautifulSoup(r.text, "html.parser")
-
-              for tag in soup([
-                  "script", "style", "nav",
-                  "header", "footer", "form",
-              ]):
-                  tag.decompose()
-
-              text = normalize(
-                  soup.get_text(" ", strip=True)
-              )
-
-              published = parse_date_from_page(
-                  soup,
-                  text,
-              )
-
-              if (
-                  published is None
-                  or published < START
-                  or published > date.today()
-              ):
-                  return None
-
-              low = text.lower()
-
-              # Must clearly concern Gaza casualties.
-              if (
-                  "gaza" not in low
-                  and "غزة" not in text
-              ):
-                  return None
-
-              if not full_war_context(
-                  text,
-                  published,
-              ):
-                  return None
-
-              pairs = extract_pairs(text)
-
-              if not pairs:
-                  return None
-
-              # One official post containing multiple different plausible
-              # cumulative pairs is ambiguous; do not guess.
-              if len(pairs) != 1:
-                  print(
-                      "AMBIGUOUS MOH POST",
-                      published,
-                      url,
-                      sorted(pairs),
+              if not issues:
+                  raise RuntimeError(
+                      "No WHO Gaza emergency situation-report "
+                      "issues were discovered."
                   )
-                  return None
 
-              killed, injured = next(iter(pairs))
+              output = [
+                  issues[key]
+                  for key in sorted(issues)
+              ]
 
-              return {
-                  "date": published.isoformat(),
-                  "killed": killed,
-                  "injured": injured,
-                  "source_url": url,
-                  "series_label": "Gaza Ministry of Health",
-                  "source_type": "Gaza Ministry of Health",
-                  "parser_version": VERSION,
-              }
+              print(
+                  "WHO archive discovered",
+                  len(output),
+                  "issues:",
+                  output[0]["issue"],
+                  "through",
+                  output[-1]["issue"],
+              )
 
-          def reconcile(rows):
-              # Same-date duplicates are common because translated and Arabic
-              # versions may both exist. Agreement is good; disagreement means
-              # omit that date instead of choosing one.
-              by_date = {}
+              return output
 
-              for row in rows:
-                  by_date.setdefault(
-                      row["date"],
-                      [],
-                  ).append(row)
+          def pdf_first_page_issue(pdf_bytes):
+              """
+              Return the WHO issue number printed on page 1, if present.
+              Used to prevent an intermediate WHO page from sending us to
+              a different issue's PDF.
+              """
+              with tempfile.TemporaryDirectory() as folder:
+                  pdf = Path(folder) / "candidate.pdf"
+                  txt = Path(folder) / "candidate.txt"
+                  pdf.write_bytes(pdf_bytes)
 
-              selected = []
+                  result = subprocess.run(
+                      [
+                          "pdftotext",
+                          "-f", "1",
+                          "-l", "1",
+                          "-layout",
+                          str(pdf),
+                          str(txt),
+                      ],
+                      capture_output=True,
+                      text=True,
+                  )
 
-              for d in sorted(by_date):
-                  day_rows = by_date[d]
-                  pairs = {
-                      (r["killed"], r["injured"])
-                      for r in day_rows
-                  }
+                  if (
+                      result.returncode != 0
+                      or not txt.exists()
+                  ):
+                      return None
 
-                  if len(pairs) != 1:
+                  content = txt.read_text(
+                      encoding="utf-8",
+                      errors="ignore",
+                  )
+
+                  match = PDF_ISSUE.search(content[:2500])
+                  return (
+                      int(match.group(1))
+                      if match else None
+                  )
+
+          def resolve_pdf(url, expected_issue):
+              """
+              Resolve the WHO archive link to the PDF for exactly
+              expected_issue.
+
+              Some WHO archive links open an intermediate page containing
+              multiple situation-report PDFs. The older resolver simply chose
+              the highest-scoring PDF and could therefore select a later issue.
+              This version verifies the issue number printed on page 1.
+              """
+              r = get(url, timeout=90)
+
+              ctype = (
+                  r.headers.get(
+                      "content-type",
+                      "",
+                  ).lower()
+              )
+
+              # Direct PDF link: only accept it if the printed issue matches.
+              if (
+                  r.content.startswith(b"%PDF")
+                  or "application/pdf" in ctype
+              ):
+                  actual_issue = pdf_first_page_issue(
+                      r.content
+                  )
+
+                  if (
+                      actual_issue is None
+                      or actual_issue == expected_issue
+                  ):
+                      return r.url, r.content
+
+                  raise RuntimeError(
+                      f"direct PDF is issue {actual_issue}, "
+                      f"expected issue {expected_issue}"
+                  )
+
+              soup = BeautifulSoup(
+                  r.text,
+                  "html.parser",
+              )
+
+              candidates = []
+
+              for a in soup.find_all("a", href=True):
+                  href = urljoin(
+                      r.url,
+                      a["href"],
+                  )
+
+                  if ".pdf" not in href.lower():
+                      continue
+
+                  label = clean(
+                      a.get_text(" ", strip=True)
+                  ).lower()
+                  low_href = href.lower()
+
+                  score = 0
+
+                  # Strongly prefer a link whose visible text/filename
+                  # mentions the exact expected issue.
+                  issue_tokens = (
+                      f"issue-{expected_issue}",
+                      f"issue_{expected_issue}",
+                      f"issue {expected_issue}",
+                      f"sitrep_{expected_issue}",
+                      f"sitrep-{expected_issue}",
+                      f"sitrep{expected_issue}",
+                  )
+
+                  combined = label + " " + low_href
+
+                  if any(
+                      token in combined
+                      for token in issue_tokens
+                  ):
+                      score += 100
+
+                  score += (
+                      ("download" in label) * 2
+                      + ("report" in label) * 2
+                      + ("sitrep" in low_href) * 3
+                      + ("palestine" in low_href) * 2
+                      + ("opt" in low_href) * 2
+                  )
+
+                  candidates.append(
+                      (score, href)
+                  )
+
+              if not candidates:
+                  raise RuntimeError(
+                      "WHO archive link did not expose any PDFs: "
+                      + url
+                  )
+
+              # Highest-likelihood links first, but verify the printed
+              # issue number before accepting anything.
+              candidates.sort(
+                  key=lambda item: item[0],
+                  reverse=True,
+              )
+
+              seen = set()
+
+              for _, href in candidates:
+                  if href in seen:
+                      continue
+                  seen.add(href)
+
+                  try:
+                      candidate = get(
+                          href,
+                          timeout=120,
+                      )
+                  except Exception as error:
                       print(
-                          "DATE CONFLICT OMITTED",
-                          d,
-                          sorted(pairs),
+                          "Candidate PDF fetch failed:",
+                          href,
+                          error,
                       )
                       continue
 
-                  # Prefer an English URL only for readability if the figures
-                  # are identical; both are Ministry sources.
-                  day_rows.sort(
-                      key=lambda r: (
-                          "/english/" not in r["source_url"]
-                          and "press-release" not in r["source_url"],
-                          r["source_url"],
-                      )
+                  if not candidate.content.startswith(b"%PDF"):
+                      continue
+
+                  actual_issue = pdf_first_page_issue(
+                      candidate.content
                   )
-                  selected.append(day_rows[0])
 
-              # Validate cumulative sequence without altering source values.
-              final = []
+                  if actual_issue == expected_issue:
+                      print(
+                          f"Resolved archive issue {expected_issue} "
+                          f"to matching PDF: {candidate.url}"
+                      )
+                      return (
+                          candidate.url,
+                          candidate.content,
+                      )
 
-              for row in selected:
-                  if final:
-                      prev = final[-1]
+                  print(
+                      f"Rejected candidate PDF for issue "
+                      f"{expected_issue}: printed issue "
+                      f"{actual_issue} ({candidate.url})"
+                  )
+
+              raise RuntimeError(
+                  f"No PDF with printed issue {expected_issue} "
+                  f"was found from WHO archive link {url}"
+              )
+
+          def report_text_views(pdf_bytes):
+              """
+              Pages 1-4 in both layout and raw reading order.
+              Spatial parsing remains primary; this is strict fallback only.
+              """
+              outputs = []
+
+              with tempfile.TemporaryDirectory() as folder:
+                  pdf = Path(folder) / "report.pdf"
+                  pdf.write_bytes(pdf_bytes)
+
+                  for mode in ("layout", "raw"):
+                      txt = Path(folder) / f"pages-{mode}.txt"
+
+                      command = [
+                          "pdftotext",
+                          "-f", "1",
+                          "-l", "4",
+                      ]
+
+                      command.append(
+                          "-layout"
+                          if mode == "layout"
+                          else "-raw"
+                      )
+
+                      command += [
+                          str(pdf),
+                          str(txt),
+                      ]
+
+                      result = subprocess.run(
+                          command,
+                          capture_output=True,
+                          text=True,
+                      )
 
                       if (
-                          row["killed"] < prev["killed"]
-                          or row["injured"] < prev["injured"]
+                          result.returncode == 0
+                          and txt.exists()
                       ):
+                          content = txt.read_text(
+                              encoding="utf-8",
+                              errors="ignore",
+                          )
+
+                          if content.strip():
+                              outputs.append(
+                                  (mode, content)
+                              )
+
+              return outputs
+
+          def valid(killed, injured):
+              return (
+                  100 <= killed <= 500000
+                  and 100 <= injured <= 1000000
+                  and injured > killed
+              )
+
+          def normalize_views(texts):
+              return [
+                  (mode, clean(content))
+                  for mode, content in texts
+                  if clean(content)
+              ]
+
+          def extract_number_near_label(flat, label_regex, radius=120):
+              values = set()
+
+              for label in re.finditer(
+                  label_regex,
+                  flat,
+                  re.I,
+              ):
+                  left = flat[
+                      max(0, label.start() - radius):
+                      label.start()
+                  ]
+                  right = flat[
+                      label.end():
+                      min(len(flat), label.end() + radius)
+                  ]
+
+                  left_nums = list(re.finditer(NUM, left))
+                  right_nums = list(re.finditer(NUM, right))
+
+                  if left_nums:
+                      m = left_nums[-1]
+                      if len(left) - m.end() <= 70:
+                          values.add(n(m.group(0)))
+
+                  if right_nums:
+                      m = right_nums[0]
+                      if m.start() <= 70:
+                          values.add(n(m.group(0)))
+
+              return values
+
+          def layout_early_explicit(flat):
+              killed = set()
+              injured = set()
+
+              for label in (
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"Palestinians?\s+killed\s+in\s+Gaza",
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"people\s+killed\s+in\s+Gaza",
+                  r"Number\s+of\s+people\s+killed\s+in\s+Gaza",
+              ):
+                  killed.update(
+                      extract_number_near_label(flat, label)
+                  )
+
+              for label in (
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"Palestinians?\s+injured\s+in\s+Gaza",
+                  r"(?:Estimated\s+number\s+of\s+)?"
+                  r"people\s+injured\s+in\s+Gaza",
+                  r"Number\s+of\s+people\s+injured\s+in\s+Gaza",
+              ):
+                  injured.update(
+                      extract_number_near_label(flat, label)
+                  )
+
+              return [
+                  (k, i, "layout-early-explicit")
+                  for k in killed
+                  for i in injured
+                  if valid(k, i)
+              ]
+
+          def gaza_overview_block(flat):
+              low = flat.lower()
+              gaza = low.find("gaza strip")
+              if gaza < 0:
+                  return None
+
+              source = low.find(
+                  "source: ministry of health",
+                  gaza,
+              )
+              if source < 0:
+                  source = low.find(
+                      "source ministry of health",
+                      gaza,
+                  )
+              if source < 0:
+                  return None
+
+              stops = []
+              for marker in (
+                  "health facility",
+                  "health care functioning",
+                  "healthcare functioning",
+                  "health attacks",
+                  "hospital functionality",
+                  "hospitals functionality",
+                  "phcc",
+              ):
+                  pos = low.find(marker, source + 10)
+                  if pos > source:
+                      stops.append(pos)
+
+              end = min(stops) if stops else min(len(flat), source + 2400)
+              return flat[gaza:end]
+
+          def layout_overview_cards(flat):
+              block = gaza_overview_block(flat)
+              if not block:
+                  return []
+
+              killed = set()
+              injured = set()
+
+              for pattern in (
+                  rf"(?P<n>{NUM})\s+(?:Reported\s+)?Fatalit(?:y|ies)\b",
+                  rf"\bFatalit(?:y|ies)\b[^\d]{{0,50}}(?P<n>{NUM})",
+              ):
+                  for m in re.finditer(pattern, block, re.I):
+                      killed.add(n(m.group("n")))
+
+              for pattern in (
+                  rf"(?P<n>{NUM})\s+(?:Reported\s+)?Injur(?:y|ies)\b",
+                  rf"\bInjur(?:y|ies)\b[^\d]{{0,50}}(?P<n>{NUM})",
+              ):
+                  for m in re.finditer(pattern, block, re.I):
+                      injured.add(n(m.group("n")))
+
+              return [
+                  (k, i, "layout-overview-cards")
+                  for k in killed
+                  for i in injured
+                  if valid(k, i)
+              ]
+
+          def layout_cumulative_sentence(flat):
+              patterns = [
+                  re.compile(
+                      rf"(?:cumulative\s+toll|cumulatively)"
+                      rf".{{0,180}}?(?:since\s+October\s+2023|"
+                      rf"since\s+7\s+October\s+2023)"
+                      rf".{{0,200}}?(?P<k>{NUM})\s+"
+                      rf"(?:deaths|fatalities|people\s+(?:have\s+been\s+)?killed)"
+                      rf".{{0,220}}?(?P<i>{NUM})\s+"
+                      rf"(?:injuries|people\s+injured|injured)",
+                      re.I | re.S,
+                  ),
+                  re.compile(
+                      rf"(?:brings?|bringing)\s+the\s+cumulative\s+toll"
+                      rf".{{0,180}}?since\s+(?:7\s+)?October\s+2023"
+                      rf".{{0,180}}?(?P<k>{NUM})\s+"
+                      rf"(?:deaths|fatalities)"
+                      rf".{{0,180}}?(?P<i>{NUM})\s+"
+                      rf"(?:injuries|injured)",
+                      re.I | re.S,
+                  ),
+              ]
+
+              out = []
+              for pattern in patterns:
+                  for m in pattern.finditer(flat):
+                      k = n(m.group("k"))
+                      i = n(m.group("i"))
+                      if valid(k, i):
+                          out.append((k, i, "layout-cumulative-sentence"))
+              return out
+
+          def parse_known_layouts(texts):
+              """
+              Accept only one of three known WHO structures:
+              1) early explicit Gaza killed/injured labels
+              2) Gaza Strip Overview + Source: Ministry of Health + Fatalities/Injuries
+              3) explicit cumulative-since-Oct-2023 sentence
+              """
+              all_pairs = {}
+
+              for mode, flat in normalize_views(texts):
+                  candidates = []
+                  candidates.extend(layout_early_explicit(flat))
+                  candidates.extend(layout_overview_cards(flat))
+                  candidates.extend(layout_cumulative_sentence(flat))
+
+                  for k, i, method in candidates:
+                      all_pairs.setdefault((k, i), set()).add(f"{method}:{mode}")
+
+              return all_pairs
+
+
+
+          # -----------------------------------------------------------------
+          # SPATIAL PAGE-1 PARSER
+          # -----------------------------------------------------------------
+
+          def word_number(text):
+              raw = re.sub(r"[,\s]", "", text or "")
+              if not re.fullmatch(r"\d{3,6}", raw):
+                  return None
+              try:
+                  return int(raw)
+              except Exception:
+                  return None
+
+          def spatial_pages(pdf_bytes, max_pages=4):
+              """
+              Extract positioned words from pages 1-4 independently.
+              Some WHO issues place the Gaza overview after page 1.
+              """
+              with tempfile.NamedTemporaryFile(
+                  suffix=".pdf",
+                  delete=False,
+              ) as tmp:
+                  tmp.write(pdf_bytes)
+                  tmp_path = tmp.name
+
+              output = []
+
+              try:
+                  with pdfplumber.open(tmp_path) as pdf:
+                      for page_index, page in enumerate(
+                          pdf.pages[:max_pages]
+                      ):
+                          output.append({
+                              "page": page_index + 1,
+                              "words": page.extract_words(
+                                  x_tolerance=2,
+                                  y_tolerance=3,
+                                  keep_blank_chars=False,
+                                  use_text_flow=False,
+                              ) or [],
+                          })
+                  return output
+              finally:
+                  try:
+                      Path(tmp_path).unlink()
+                  except Exception:
+                      pass
+
+          def line_groups(words, tolerance=4):
+              """
+              Convert positioned words into visual lines while retaining the
+              bounding box of each line.
+              """
+              rows = []
+
+              for word in sorted(
+                  words,
+                  key=lambda w: (
+                      float(w.get("top", 0)),
+                      float(w.get("x0", 0)),
+                  ),
+              ):
+                  top = float(word.get("top", 0))
+                  target = None
+
+                  for row in rows[-8:]:
+                      if abs(row["top"] - top) <= tolerance:
+                          target = row
+                          break
+
+                  if target is None:
+                      target = {
+                          "top": top,
+                          "words": [],
+                      }
+                      rows.append(target)
+
+                  target["words"].append(word)
+
+              output = []
+
+              for row in rows:
+                  ws = sorted(
+                      row["words"],
+                      key=lambda w: float(w.get("x0", 0)),
+                  )
+                  text = " ".join(
+                      str(w.get("text", ""))
+                      for w in ws
+                  )
+                  output.append({
+                      "text": clean(text),
+                      "top": min(float(w.get("top", 0)) for w in ws),
+                      "bottom": max(float(w.get("bottom", 0)) for w in ws),
+                      "x0": min(float(w.get("x0", 0)) for w in ws),
+                      "x1": max(float(w.get("x1", 0)) for w in ws),
+                      "words": ws,
+                  })
+
+              return output
+
+          def numeric_words(words):
+              out = []
+
+              for word in words:
+                  value = word_number(
+                      str(word.get("text", ""))
+                  )
+                  if value is None:
+                      continue
+
+                  out.append({
+                      "value": value,
+                      "x0": float(word.get("x0", 0)),
+                      "x1": float(word.get("x1", 0)),
+                      "top": float(word.get("top", 0)),
+                      "bottom": float(word.get("bottom", 0)),
+                  })
+
+              return out
+
+          def center_x(item):
+              return (
+                  float(item["x0"])
+                  + float(item["x1"])
+              ) / 2.0
+
+          def nearest_card_number(
+              label,
+              numbers,
+              minimum,
+              maximum,
+          ):
+              """
+              WHO cards generally put the value immediately above/below the
+              label and within the same column. Rank by vertical proximity
+              with a heavy penalty for horizontal misalignment.
+              """
+              lx = center_x(label)
+              candidates = []
+
+              for num in numbers:
+                  value = num["value"]
+
+                  if not (
+                      minimum <= value <= maximum
+                  ):
+                      continue
+
+                  nx = center_x(num)
+                  dx = abs(nx - lx)
+
+                  # Same card / column.
+                  if dx > 125:
+                      continue
+
+                  if num["bottom"] <= label["top"]:
+                      dy = label["top"] - num["bottom"]
+                  elif num["top"] >= label["bottom"]:
+                      dy = num["top"] - label["bottom"]
+                  else:
+                      dy = 0
+
+                  if dy > 125:
+                      continue
+
+                  score = dy + dx * 0.55
+                  candidates.append(
+                      (score, value)
+                  )
+
+              if not candidates:
+                  return None
+
+              candidates.sort(
+                  key=lambda item: item[0]
+              )
+
+              # If two differently-valued numbers are virtually equally close,
+              # don't guess.
+              if (
+                  len(candidates) > 1
+                  and candidates[1][0] - candidates[0][0] < 5
+                  and candidates[1][1] != candidates[0][1]
+              ):
+                  return None
+
+              return candidates[0][1]
+
+          def find_label_lines(lines, regex):
+              return [
+                  line
+                  for line in lines
+                  if re.search(
+                      regex,
+                      line["text"],
+                      re.I,
+                  )
+              ]
+
+          def spatial_early_labels(words, lines):
+              killed_labels = find_label_lines(
+                  lines,
+                  r"(?:people|Palestinians?)\s+"
+                  r"killed\s+in\s+Gaza",
+              )
+              injured_labels = find_label_lines(
+                  lines,
+                  r"(?:people|Palestinians?)\s+"
+                  r"injured\s+in\s+Gaza",
+              )
+
+              nums = numeric_words(words)
+              pairs = []
+
+              for kl in killed_labels:
+                  killed = nearest_card_number(
+                      kl,
+                      nums,
+                      100,
+                      500000,
+                  )
+                  if killed is None:
+                      continue
+
+                  for il in injured_labels:
+                      injured = nearest_card_number(
+                          il,
+                          nums,
+                          100,
+                          1000000,
+                      )
+                      if (
+                          injured is not None
+                          and valid(killed, injured)
+                      ):
+                          pairs.append(
+                              (
+                                  killed,
+                                  injured,
+                                  "spatial-early-gaza-labels",
+                              )
+                          )
+
+              return pairs
+
+          def spatial_overview_cards(words, lines):
+              """
+              Locate the WHO Gaza overview region first, then the Fatalities and
+              Injuries cards inside it. This prevents health-attack/subgroup
+              figures elsewhere on page 1 from being considered.
+              """
+              gaza_lines = find_label_lines(
+                  lines,
+                  r"\bGaza\s+Strip\b",
+              )
+
+              source_lines = find_label_lines(
+                  lines,
+                  r"Source:?\s+Ministry\s+of\s+Health",
+              )
+
+              if not gaza_lines or not source_lines:
+                  return []
+
+              # Choose source line closest below a Gaza Strip heading.
+              regions = []
+
+              for gaza in gaza_lines:
+                  for source in source_lines:
+                      delta = source["top"] - gaza["top"]
+                      if 0 <= delta <= 260:
+                          regions.append(
+                              (delta, gaza, source)
+                          )
+
+              if not regions:
+                  return []
+
+              regions.sort(
+                  key=lambda item: item[0]
+              )
+              _, gaza, source = regions[0]
+
+              top_min = max(
+                  0,
+                  gaza["top"] - 30,
+              )
+              top_max = source["top"] + 260
+
+              scoped_lines = [
+                  line
+                  for line in lines
+                  if top_min <= line["top"] <= top_max
+              ]
+
+              fatalities = find_label_lines(
+                  scoped_lines,
+                  r"\b(?:Reported\s+)?Fatalit(?:y|ies)\b",
+              )
+              injuries = find_label_lines(
+                  scoped_lines,
+                  r"\b(?:Reported\s+)?Injur(?:y|ies)\b",
+              )
+
+              nums = [
+                  num
+                  for num in numeric_words(words)
+                  if (
+                      top_min - 40
+                      <= num["top"]
+                      <= top_max + 40
+                  )
+              ]
+
+              pairs = []
+
+              for fl in fatalities:
+                  killed = nearest_card_number(
+                      fl,
+                      nums,
+                      100,
+                      500000,
+                  )
+
+                  if killed is None:
+                      continue
+
+                  for il in injuries:
+                      injured = nearest_card_number(
+                          il,
+                          nums,
+                          100,
+                          1000000,
+                      )
+
+                      if (
+                          injured is not None
+                          and valid(killed, injured)
+                      ):
+                          pairs.append(
+                              (
+                                  killed,
+                                  injured,
+                                  "spatial-gaza-overview",
+                              )
+                          )
+
+              return pairs
+
+          def spatial_parse(pdf_bytes):
+              """
+              Search pages 1-4 separately. A killed/injured pair must be
+              supported by one page; values are never combined across pages.
+              """
+              output = {}
+
+              for page_info in spatial_pages(
+                  pdf_bytes,
+                  max_pages=4,
+              ):
+                  words = page_info["words"]
+
+                  if not words:
+                      continue
+
+                  lines = line_groups(words)
+
+                  candidates = []
+                  candidates.extend(
+                      spatial_early_labels(
+                          words,
+                          lines,
+                      )
+                  )
+                  candidates.extend(
+                      spatial_overview_cards(
+                          words,
+                          lines,
+                      )
+                  )
+
+                  for killed, injured, method in candidates:
+                      output.setdefault(
+                          (killed, injured),
+                          set(),
+                      ).add(
+                          f"{method}:page{page_info['page']}"
+                      )
+
+              return output
+
+
+          def parse_issue(meta):
+              try:
+                  if meta["issue"] in DIRECT_ISSUE_URLS:
+                      direct = DIRECT_ISSUE_URLS[
+                          meta["issue"]
+                      ]
+                      response = get(
+                          direct,
+                          timeout=120,
+                      )
+
+                      if not response.content.startswith(b"%PDF"):
+                          raise RuntimeError(
+                              "direct WHO override is not a PDF"
+                          )
+
+                      actual_issue = pdf_first_page_issue(
+                          response.content
+                      )
+
+                      if actual_issue != meta["issue"]:
+                          raise RuntimeError(
+                              f"direct override printed issue "
+                              f"{actual_issue}, expected "
+                              f"{meta['issue']}"
+                          )
+
+                      pdf_url = response.url
+                      pdf_bytes = response.content
+
+                  else:
+                      pdf_url, pdf_bytes = resolve_pdf(
+                          meta["url"],
+                          meta["issue"],
+                      )
+
+              except Exception as error:
+                  print(
+                      f"ISSUE {meta['issue']} PDF FAILED:",
+                      error,
+                  )
+                  return None
+
+              texts = report_text_views(
+                  pdf_bytes
+              )
+
+              if not texts:
+                  print(
+                      "ISSUE",
+                      meta["issue"],
+                      "has no usable first-page text",
+                  )
+                  return None
+
+              usable_texts = []
+
+              for mode, content in texts:
+                  issue_match = PDF_ISSUE.search(
+                      content[:2500]
+                  )
+
+                  if issue_match:
+                      parsed_issue = int(
+                          issue_match.group(1)
+                      )
+
+                      if parsed_issue != meta["issue"]:
                           print(
-                              "DECREASING POINT OMITTED",
-                              row,
+                              "ISSUE NUMBER MISMATCH:",
+                              meta["issue"],
+                              "archive vs",
+                              parsed_issue,
+                              f"PDF ({mode})",
                           )
                           continue
 
-                      d1 = datetime.fromisoformat(
-                          prev["date"]
-                      ).date()
-                      d2 = datetime.fromisoformat(
-                          row["date"]
-                      ).date()
-                      days = max(1, (d2 - d1).days)
+                  usable_texts.append(
+                      (mode, content)
+                  )
 
-                      # Only catches obvious parser errors, not substantive
-                      # source revisions.
+              # Primary method: use the actual visual coordinates from the
+              # PDF so card values stay attached to their labels.
+              all_pairs = spatial_parse(
+                  pdf_bytes
+              )
+
+              # Strict text-layout parser is fallback only.
+              text_pairs = parse_known_layouts(
+                  usable_texts
+              )
+
+              if not all_pairs:
+                  all_pairs = text_pairs
+              else:
+                  # Agreement from text extraction strengthens the same pair.
+                  for pair, methods in text_pairs.items():
+                      if pair in all_pairs:
+                          all_pairs[pair].update(
+                              methods
+                          )
+
+              if not all_pairs:
+                  print(
+                      "NO CASUALTY PAIR: issue",
+                      meta["issue"],
+                      meta["date"],
+                  )
+                  return None
+
+              # The same true pair appearing through multiple layouts/methods
+              # is strong agreement. Different pairs are rejected.
+              if len(all_pairs) > 1:
+                  print(
+                      "AMBIGUOUS ISSUE",
+                      meta["issue"],
+                      list(all_pairs),
+                  )
+                  return None
+
+              (killed, injured), methods = next(
+                  iter(all_pairs.items())
+              )
+
+              return {
+                  "date": meta["date"],
+                  "killed": killed,
+                  "injured": injured,
+                  "source_url": pdf_url,
+                  "series_label": (
+                      "WHO Emergency Situation Report "
+                      f"#{meta['issue']}"
+                  ),
+                  "source_type": "WHO EMRO",
+                  "issue": meta["issue"],
+                  "parse_method": "+".join(
+                      sorted(methods)
+                  ),
+                  "parser_version": VERSION,
+              }
+
+          def validate(rows):
+              rows.sort(
+                  key=lambda row: row["issue"]
+              )
+
+              final = []
+
+              for row in rows:
+                  if final:
+                      previous = final[-1]
+
+                      # WHO/MoH cumulative figures should not go backwards.
+                      # Never correct a source value automatically.
                       if (
-                          (row["killed"] - prev["killed"]) / days > 5000
-                          or
-                          (row["injured"] - prev["injured"]) / days > 15000
+                          row["killed"]
+                          < previous["killed"]
+                          or row["injured"]
+                          < previous["injured"]
                       ):
                           print(
-                              "IMPOSSIBLE JUMP OMITTED",
-                              row,
+                              "DECREASING TOTAL OMITTED:",
+                              row["issue"],
+                              row["killed"],
+                              row["injured"],
                           )
                           continue
 
@@ -547,90 +1211,190 @@ jobs:
 
               return final
 
+          def load_existing_good():
+              """
+              Preserve previously published WHO-only issue records. This lets
+              the parser add coverage without deleting a record just because
+              a later run encounters a temporary PDF/layout problem.
+              """
+              if not OUT.exists():
+                  return {}
+
+              try:
+                  payload = json.loads(
+                      OUT.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              except Exception:
+                  return {}
+
+              good = {}
+
+              for row in payload.get("records", []):
+                  source_type = str(
+                      row.get("source_type", "")
+                  ).lower()
+                  label = str(
+                      row.get("series_label", "")
+                  ).lower()
+
+                  if (
+                      "who" not in source_type
+                      and "who" not in label
+                  ):
+                      continue
+
+                  issue = row.get("issue")
+
+                  if issue is None:
+                      m = re.search(
+                          r"#(\d+)",
+                          str(row.get("series_label", "")),
+                      )
+                      issue = (
+                          int(m.group(1))
+                          if m else None
+                      )
+
+                  if issue is None:
+                      continue
+
+                  try:
+                      killed = int(row["killed"])
+                      injured = int(row["injured"])
+                  except Exception:
+                      continue
+
+                  if valid(killed, injured):
+                      good[int(issue)] = row
+
+              return good
+
           def main():
               OUT.parent.mkdir(
                   parents=True,
                   exist_ok=True,
               )
 
-              posts = discover_posts()
+              metas = discover()
               rows = []
 
+              for index, meta in enumerate(
+                  metas,
+                  start=1,
+              ):
+                  print(
+                      f"Parsing WHO issue {meta['issue']} "
+                      f"({index}/{len(metas)})"
+                  )
+
+                  row = parse_issue(meta)
+
+                  if row:
+                      print(
+                          "FOUND",
+                          row["issue"],
+                          row["date"],
+                          row["killed"],
+                          row["injured"],
+                          row["parse_method"],
+                      )
+                      rows.append(row)
+
+              rows = validate(rows)
+
+              parsed_by_issue = {
+                  int(row["issue"]): row
+                  for row in rows
+              }
+
+              existing_good = load_existing_good()
+              archive_issues = {
+                  int(meta["issue"])
+                  for meta in metas
+              }
+              restored = 0
+
+              for issue, old_row in existing_good.items():
+                  if (
+                      issue in archive_issues
+                      and issue not in parsed_by_issue
+                  ):
+                      parsed_by_issue[issue] = old_row
+                      restored += 1
+
+              rows = list(parsed_by_issue.values())
+              rows.sort(
+                  key=lambda row: int(
+                      row.get("issue", 9999)
+                  )
+              )
+              rows = validate(rows)
+
               print(
-                  "Parsing",
-                  len(posts),
-                  "official Ministry posts",
+                  "WHO parsing summary:",
+                  len(rows),
+                  "accepted records from",
+                  len(metas),
+                  "archive issues;",
+                  restored,
+                  "previously verified WHO records preserved",
               )
 
-              with ThreadPoolExecutor(
-                  max_workers=5
-              ) as executor:
-                  futures = {
-                      executor.submit(
-                          parse_post,
-                          url,
-                      ): url
-                      for url in posts
-                  }
+              # Safety gate: never overwrite the timeline with a sparse parse.
+              if len(rows) < 35:
+                  missing = sorted(
+                      set(meta["issue"] for meta in metas)
+                      - set(row["issue"] for row in rows)
+                  )
 
-                  done = 0
-
-                  for future in as_completed(futures):
-                      done += 1
-
-                      try:
-                          row = future.result()
-                      except Exception as error:
-                          print(
-                              "PARSE FAILED",
-                              futures[future],
-                              error,
-                          )
-                          row = None
-
-                      if row:
-                          print(
-                              "FOUND",
-                              row["date"],
-                              row["killed"],
-                              row["injured"],
-                          )
-                          rows.append(row)
-
-                      if done % 100 == 0:
-                          print(
-                              "Checked",
-                              done,
-                              "/",
-                              len(posts),
-                          )
-
-              rows = reconcile(rows)
-
-              if len(rows) < 10:
                   raise RuntimeError(
                       "Only "
                       + str(len(rows))
-                      + " Ministry casualty points parsed. "
-                      + "Refusing to overwrite the existing timeline."
+                      + " WHO issues parsed successfully. "
+                      + "Refusing to publish. Missing/unparsed issues: "
+                      + ", ".join(map(str, missing))
                   )
 
+              public = [
+                  {
+                      "date": row["date"],
+                      "killed": row["killed"],
+                      "injured": row["injured"],
+                      "source_url": row["source_url"],
+                      "series_label": row["series_label"],
+                      "source_type": row["source_type"],
+                      "issue": row["issue"],
+                      "parser_version": VERSION,
+                  }
+                  for row in rows
+              ]
+
               payload = {
-                  "source": "Gaza Ministry of Health official website",
+                  "source": (
+                      "WHO Eastern Mediterranean Regional Office "
+                      "Gaza emergency situation reports"
+                  ),
+                  "underlying_source": (
+                      "Gaza Ministry of Health, as labelled by WHO"
+                  ),
                   "method": (
-                      "Official moh.gov.ps posts only. English and Arabic "
-                      "cumulative killed/injured statements are parsed; "
-                      "Arabic-Indic numerals are normalized. Statements "
-                      "limited to a ceasefire/sub-period are rejected. "
-                      "Ambiguous, conflicting, decreasing, or implausible "
-                      "points are omitted. No WHO/OCHA fallback, OCR, "
-                      "interpolation, or inferred totals."
+                      "Issue number and date come from WHO's official "
+                      "Emergency Situation Reports archive. Pages 1-4 are "
+                      "parsed spatially so values stay attached to WHO's "
+                      "Gaza-specific Fatalities/Injuries cards or explicit "
+                      "killed/injured-in-Gaza labels. Raw/layout text is a "
+                      "strict fallback. Previously verified WHO-only records "
+                      "are preserved when a later parse temporarily misses an "
+                      "issue. No OCR, interpolation, OCHA fallback, or inferred "
+                      "totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
                   ).isoformat(),
                   "parser_version": VERSION,
-                  "records": rows,
+                  "records": public,
               }
 
               OUT.write_text(
@@ -644,18 +1408,18 @@ jobs:
 
               print(
                   "SUCCESS:",
-                  len(rows),
-                  "direct Ministry points from",
-                  rows[0]["date"],
+                  len(public),
+                  "WHO casualty points from",
+                  public[0]["date"],
                   "through",
-                  rows[-1]["date"],
+                  public[-1]["date"],
               )
 
           if __name__ == "__main__":
               main()
           PY
 
-          python /tmp/update_moh.py
+          python /tmp/update_who.py
 
       - name: Commit casualty timeline
         run: |
@@ -663,5 +1427,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/casualty-timeline.json
           git diff --cached --quiet && exit 0
-          git commit -m "Update Gaza casualty timeline from Ministry of Health"
+          git commit -m "Expand WHO Gaza casualty timeline"
           git push
