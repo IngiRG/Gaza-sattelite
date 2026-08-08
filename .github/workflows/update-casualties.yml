@@ -43,7 +43,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 18
+          VERSION = 20
 
           ARCHIVES = [
               # Canonical WHO Gaza Emergency Situation Reports archive.
@@ -1069,40 +1069,372 @@ jobs:
 
               return results
 
+          # -----------------------------------------------------------------
+          # GENERIC SEMANTIC CASUALTY PARSER
+          # -----------------------------------------------------------------
+
+          KILLED_LABEL = re.compile(
+              r"\b(?:killed|fatalit(?:y|ies)|deaths?)\b",
+              re.I,
+          )
+
+          INJURED_LABEL = re.compile(
+              r"\b(?:injured|injur(?:y|ies)|wounded)\b",
+              re.I,
+          )
+
+          GAZA_CONTEXT = re.compile(
+              r"\bGaza(?:\s+Strip)?\b",
+              re.I,
+          )
+
+          MOH_CONTEXT = re.compile(
+              r"\b(?:Ministry\s+of\s+Health|MoH)\b",
+              re.I,
+          )
+
+          def line_distance(a, b):
+              ax = center_x(a)
+              bx = center_x(b)
+              ay = (a["top"] + a["bottom"]) / 2
+              by = (b["top"] + b["bottom"]) / 2
+              return abs(ay - by) + abs(ax - bx) * 0.35
+
+          def section_context(lines, label_line, radius=8):
+              """
+              Return nearby visual lines around a casualty label.
+              This is used to decide whether the label belongs to Gaza/MoH.
+              """
+              try:
+                  idx = lines.index(label_line)
+              except ValueError:
+                  return ""
+
+              start = max(0, idx - radius)
+              end = min(len(lines), idx + radius + 1)
+
+              return " ".join(
+                  line["text"]
+                  for line in lines[start:end]
+              )
+
+          def semantic_number_for_label(
+              label_line,
+              numbers,
+              minimum,
+              maximum,
+          ):
+              """
+              Find the number most plausibly attached to a casualty label.
+
+              Supports:
+              - number above label
+              - number below label
+              - number immediately left/right
+              - number on the same visual line
+              """
+              candidates = []
+
+              lx = center_x(label_line)
+              ly = (
+                  label_line["top"]
+                  + label_line["bottom"]
+              ) / 2
+
+              for num in numbers:
+                  value = num["value"]
+
+                  if not (
+                      minimum <= value <= maximum
+                  ):
+                      continue
+
+                  nx = center_x(num)
+                  ny = (
+                      num["top"]
+                      + num["bottom"]
+                  ) / 2
+
+                  dx = abs(nx - lx)
+                  dy = abs(ny - ly)
+
+                  # Casualty cards/rows are normally close in either
+                  # horizontal or vertical direction.
+                  if dx > 180 or dy > 140:
+                      continue
+
+                  # Strongly prefer same column or same row.
+                  score = (
+                      min(dy, 80)
+                      + min(dx, 120) * 0.42
+                  )
+
+                  same_row = (
+                      abs(
+                          num["top"]
+                          - label_line["top"]
+                      ) <= 12
+                  )
+
+                  same_column = (
+                      abs(nx - lx) <= 55
+                  )
+
+                  if same_row:
+                      score -= 35
+
+                  if same_column:
+                      score -= 30
+
+                  candidates.append(
+                      (
+                          score,
+                          value,
+                      )
+                  )
+
+              if not candidates:
+                  return None
+
+              candidates.sort(
+                  key=lambda item: item[0]
+              )
+
+              # Two nearly equal candidates with different values means
+              # the visual relation is ambiguous.
+              if (
+                  len(candidates) > 1
+                  and candidates[1][0]
+                  - candidates[0][0]
+                  < 8
+                  and candidates[1][1]
+                  != candidates[0][1]
+              ):
+                  return None
+
+              return candidates[0][1]
+
+          def semantic_page_pairs(words, lines):
+              """
+              Generic casualty extraction based on label meaning rather than
+              WHO template.
+
+              A candidate must:
+              - contain a killed/fatalities/deaths label
+              - contain an injured/injuries/wounded label
+              - be in Gaza context
+              - preferably be near Ministry of Health attribution
+              - produce a plausible cumulative pair
+              """
+              killed_lines = [
+                  line
+                  for line in lines
+                  if KILLED_LABEL.search(
+                      line["text"]
+                  )
+              ]
+
+              injured_lines = [
+                  line
+                  for line in lines
+                  if INJURED_LABEL.search(
+                      line["text"]
+                  )
+              ]
+
+              if (
+                  not killed_lines
+                  or not injured_lines
+              ):
+                  return []
+
+              numbers = numeric_words(
+                  words
+              )
+
+              candidates = []
+
+              for killed_line in killed_lines:
+                  killed_context = section_context(
+                      lines,
+                      killed_line,
+                      radius=9,
+                  )
+
+                  # Must be clearly about Gaza.
+                  if not GAZA_CONTEXT.search(
+                      killed_context
+                  ):
+                      continue
+
+                  killed = semantic_number_for_label(
+                      killed_line,
+                      numbers,
+                      100,
+                      500000,
+                  )
+
+                  if killed is None:
+                      continue
+
+                  for injured_line in injured_lines:
+                      # Labels must belong to the same visual neighborhood.
+                      if line_distance(
+                          killed_line,
+                          injured_line,
+                      ) > 360:
+                          continue
+
+                      injured_context = section_context(
+                          lines,
+                          injured_line,
+                          radius=9,
+                      )
+
+                      combined_context = (
+                          killed_context
+                          + " "
+                          + injured_context
+                      )
+
+                      if not GAZA_CONTEXT.search(
+                          combined_context
+                      ):
+                          continue
+
+                      injured = semantic_number_for_label(
+                          injured_line,
+                          numbers,
+                          100,
+                          1000000,
+                      )
+
+                      if injured is None:
+                          continue
+
+                      if not valid(
+                          killed,
+                          injured,
+                      ):
+                          continue
+
+                      # Confidence score: explicit MoH attribution is best,
+                      # Gaza mention is required, close labels are preferred.
+                      score = 0
+
+                      if MOH_CONTEXT.search(
+                          combined_context
+                      ):
+                          score += 100
+
+                      score += 40
+
+                      score -= min(
+                          80,
+                          line_distance(
+                              killed_line,
+                              injured_line,
+                          ) / 5,
+                      )
+
+                      candidates.append({
+                          "killed": killed,
+                          "injured": injured,
+                          "score": score,
+                          "context": combined_context,
+                      })
+
+              if not candidates:
+                  return []
+
+              candidates.sort(
+                  key=lambda row: row["score"],
+                  reverse=True,
+              )
+
+              best = candidates[0]
+
+              # If a competing different pair is nearly as strong, reject.
+              for other in candidates[1:]:
+                  if (
+                      best["score"]
+                      - other["score"]
+                      < 12
+                      and (
+                          best["killed"],
+                          best["injured"],
+                      )
+                      != (
+                          other["killed"],
+                          other["injured"],
+                      )
+                  ):
+                      return []
+
+              return [
+                  (
+                      best["killed"],
+                      best["injured"],
+                      "generic-semantic",
+                  )
+              ]
+
           def spatial_parse(pdf_bytes):
               """
-              Scan all pages independently.
+              Scan every page.
 
-              Never combine killed/injured values across pages. If exactly one
-              Gaza/MoH pair is found anywhere in the report, accept it.
+              Generic semantic parsing is primary: labels such as killed,
+              fatalities, deaths, injured, injuries, or wounded are matched
+              to their nearest plausible numbers within Gaza context.
+
+              Older exact-label/card parsers remain as corroborating fallback,
+              not as the main extraction logic.
               """
               output = {}
 
-              for page_info in spatial_pages(pdf_bytes):
+              for page_info in spatial_pages(
+                  pdf_bytes
+              ):
                   words = page_info["words"]
 
                   if not words:
                       continue
 
-                  lines = line_groups(words)
+                  lines = line_groups(
+                      words
+                  )
 
                   candidates = []
+
+                  # Primary generic semantic parser.
                   candidates.extend(
-                      spatial_early_labels(
+                      semantic_page_pairs(
                           words,
                           lines,
                       )
                   )
-                  candidates.extend(
-                      spatial_overview_cards(
-                          words,
-                          lines,
+
+                  # Conservative fallback for known explicit Gaza labels/cards.
+                  if not candidates:
+                      candidates.extend(
+                          spatial_early_labels(
+                              words,
+                              lines,
+                          )
                       )
-                  )
+                      candidates.extend(
+                          spatial_overview_cards(
+                              words,
+                              lines,
+                          )
+                      )
 
                   for killed, injured, method in candidates:
                       output.setdefault(
-                          (killed, injured),
+                          (
+                              killed,
+                              injured,
+                          ),
                           set(),
                       ).add(
                           f"{method}:page{page_info['page']}"
@@ -1460,12 +1792,14 @@ jobs:
                   "method": (
                       "Issue number and date come from WHO's official "
                       "Emergency Situation Reports archive. Every PDF page is "
-                      "scanned spatially until a Gaza Strip section explicitly "
-                      "tied to 'Source: Ministry of Health' is found. Both "
-                      "vertical and horizontal Fatalities/Injuries card layouts "
-                      "are supported. Raw/layout text is a strict fallback. "
-                      "Previously verified WHO-only records are preserved when "
-                      "a later parse temporarily misses an issue. No OCR, "
+                      "scanned semantically for casualty labels such as killed, "
+                      "fatalities, deaths, injured, injuries, or wounded. The "
+                      "nearest plausible numbers are accepted only when the "
+                      "surrounding visual section is clearly about Gaza; nearby "
+                      "Ministry of Health attribution increases confidence. "
+                      "Competing plausible pairs cause the report to be rejected. "
+                      "Older exact-layout rules are fallback only. Previously "
+                      "verified WHO-only records are preserved. No OCR, "
                       "interpolation, OCHA fallback, or inferred totals."
                   ),
                   "updated_at": datetime.now(
