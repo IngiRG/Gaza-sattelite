@@ -43,7 +43,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 20
+          VERSION = 21
 
           ARCHIVES = [
               # Canonical WHO Gaza Emergency Situation Reports archive.
@@ -1379,16 +1379,365 @@ jobs:
                   )
               ]
 
+          # -----------------------------------------------------------------
+          # WHOLE GAZA-SECTION PARSER
+          # -----------------------------------------------------------------
+
+          SECTION_STOP = re.compile(
+              r"\b(?:West\s+Bank|Israel|Lebanon|"
+              r"Health\s+Facility|Health\s+Care\s+Function|"
+              r"Health\s+Attacks|Hospitals?|PHCCs?|"
+              r"Medical\s+Evacuation|Nutrition|"
+              r"Communicable\s+Diseases|"
+              r"Operational\s+Response|Key\s+Challenges)\b",
+              re.I,
+          )
+
+          def gaza_section_lines(lines):
+              """
+              Isolate the visual Gaza section on a page.
+
+              Start at a 'Gaza' / 'Gaza Strip' heading and continue until the
+              next major territorial or thematic section. This lets labels and
+              values be separated by multiple lines without leaking in numbers
+              from West Bank or unrelated health-system sections.
+              """
+              starts = []
+
+              for idx, line in enumerate(lines):
+                  if re.search(
+                      r"\bGaza(?:\s+Strip)?\b",
+                      line["text"],
+                      re.I,
+                  ):
+                      starts.append(idx)
+
+              sections = []
+
+              for start in starts:
+                  end = min(
+                      len(lines),
+                      start + 45,
+                  )
+
+                  for idx in range(
+                      start + 1,
+                      min(len(lines), start + 45),
+                  ):
+                      text = lines[idx]["text"]
+
+                      if SECTION_STOP.search(text):
+                          end = idx
+                          break
+
+                  chunk = lines[start:end]
+
+                  joined = " ".join(
+                      line["text"]
+                      for line in chunk
+                  )
+
+                  # Must contain both casualty concepts somewhere in the
+                  # section. MoH attribution is preferred but not mandatory
+                  # because some WHO templates put the source label above or
+                  # below the card.
+                  if not KILLED_LABEL.search(joined):
+                      continue
+
+                  if not INJURED_LABEL.search(joined):
+                      continue
+
+                  sections.append(chunk)
+
+              return sections
+
+          def numbers_in_section(section):
+              """
+              Return all plausible casualty-scale numbers found in a Gaza
+              section, preserving visual order.
+              """
+              output = []
+
+              for line in section:
+                  for word in line["words"]:
+                      value = word_number(
+                          str(word.get("text", ""))
+                      )
+
+                      if value is None:
+                          continue
+
+                      if 100 <= value <= 1000000:
+                          output.append({
+                              "value": value,
+                              "line": line,
+                              "word": word,
+                          })
+
+              return output
+
+          def label_lines_in_section(
+              section,
+              label_regex,
+          ):
+              return [
+                  line
+                  for line in section
+                  if label_regex.search(
+                      line["text"]
+                  )
+              ]
+
+          def section_candidate_values(
+              section,
+              label_regex,
+              minimum,
+              maximum,
+          ):
+              """
+              Associate casualty labels with numbers anywhere in the same Gaza
+              section.
+
+              Ranking favors:
+              1) same line
+              2) adjacent lines
+              3) same visual column
+              4) shortest line-distance
+
+              This is deliberately broader than the old nearest-card parser.
+              """
+              labels = label_lines_in_section(
+                  section,
+                  label_regex,
+              )
+
+              nums = numbers_in_section(
+                  section
+              )
+
+              candidates = []
+
+              for label in labels:
+                  try:
+                      label_index = section.index(label)
+                  except ValueError:
+                      continue
+
+                  lx = center_x(label)
+
+                  for item in nums:
+                      value = item["value"]
+
+                      if not (
+                          minimum
+                          <= value
+                          <= maximum
+                      ):
+                          continue
+
+                      num_line = item["line"]
+
+                      try:
+                          num_index = section.index(
+                              num_line
+                          )
+                      except ValueError:
+                          continue
+
+                      line_gap = abs(
+                          num_index
+                          - label_index
+                      )
+
+                      if line_gap > 12:
+                          continue
+
+                      word = item["word"]
+                      nx = (
+                          float(word.get("x0", 0))
+                          + float(word.get("x1", 0))
+                      ) / 2
+
+                      dx = abs(nx - lx)
+
+                      score = (
+                          line_gap * 24
+                          + min(dx, 300) * 0.18
+                      )
+
+                      if line_gap == 0:
+                          score -= 45
+
+                      if line_gap == 1:
+                          score -= 20
+
+                      if dx <= 60:
+                          score -= 25
+
+                      candidates.append({
+                          "score": score,
+                          "value": value,
+                          "label": label["text"],
+                          "line_gap": line_gap,
+                      })
+
+              candidates.sort(
+                  key=lambda row: row["score"]
+              )
+
+              # Deduplicate same numeric value, keeping best score.
+              best_by_value = {}
+
+              for row in candidates:
+                  value = row["value"]
+
+                  if (
+                      value not in best_by_value
+                      or row["score"]
+                      < best_by_value[value]["score"]
+                  ):
+                      best_by_value[value] = row
+
+              return sorted(
+                  best_by_value.values(),
+                  key=lambda row: row["score"],
+              )
+
+          def semantic_gaza_section_pairs(
+              words,
+              lines,
+          ):
+              """
+              Parse killed/injured totals anywhere within a coherent Gaza
+              section. This is the main parser for templates where labels and
+              numbers are visually separated.
+              """
+              pairs = []
+
+              for section in gaza_section_lines(
+                  lines
+              ):
+                  joined = " ".join(
+                      line["text"]
+                      for line in section
+                  )
+
+                  killed_values = section_candidate_values(
+                      section,
+                      KILLED_LABEL,
+                      100,
+                      500000,
+                  )
+
+                  injured_values = section_candidate_values(
+                      section,
+                      INJURED_LABEL,
+                      100,
+                      1000000,
+                  )
+
+                  if (
+                      not killed_values
+                      or not injured_values
+                  ):
+                      continue
+
+                  candidate_pairs = []
+
+                  for k in killed_values[:6]:
+                      for i in injured_values[:6]:
+                          killed = k["value"]
+                          injured = i["value"]
+
+                          if not valid(
+                              killed,
+                              injured,
+                          ):
+                              continue
+
+                          score = (
+                              k["score"]
+                              + i["score"]
+                          )
+
+                          # MoH attribution is an important positive signal.
+                          if MOH_CONTEXT.search(
+                              joined
+                          ):
+                              score -= 70
+
+                          # Explicit Gaza-wide language strengthens the pair.
+                          if re.search(
+                              r"\b(?:Gaza\s+Strip|in\s+Gaza)\b",
+                              joined,
+                              re.I,
+                          ):
+                              score -= 30
+
+                          # Prefer pairs where both labels are within the same
+                          # broad visual area rather than far apart.
+                          score += abs(
+                              k["line_gap"]
+                              - i["line_gap"]
+                          ) * 3
+
+                          candidate_pairs.append(
+                              (
+                                  score,
+                                  killed,
+                                  injured,
+                              )
+                          )
+
+                  if not candidate_pairs:
+                      continue
+
+                  candidate_pairs.sort(
+                      key=lambda item: item[0]
+                  )
+
+                  best = candidate_pairs[0]
+
+                  # Reject only when a different pair is essentially tied.
+                  if (
+                      len(candidate_pairs) > 1
+                      and candidate_pairs[1][0]
+                      - best[0]
+                      < 10
+                      and (
+                          candidate_pairs[1][1],
+                          candidate_pairs[1][2],
+                      )
+                      != (
+                          best[1],
+                          best[2],
+                      )
+                  ):
+                      continue
+
+                  pairs.append(
+                      (
+                          best[1],
+                          best[2],
+                          "generic-gaza-section",
+                      )
+                  )
+
+              return pairs
+
           def spatial_parse(pdf_bytes):
               """
-              Scan every page.
+              Scan every page independently.
 
-              Generic semantic parsing is primary: labels such as killed,
-              fatalities, deaths, injured, injuries, or wounded are matched
-              to their nearest plausible numbers within Gaza context.
+              Primary method:
+              - isolate the whole Gaza section
+              - find killed/fatalities/deaths and injured/injuries/wounded
+                anywhere within that section
+              - associate each concept with the strongest plausible number
 
-              Older exact-label/card parsers remain as corroborating fallback,
-              not as the main extraction logic.
+              Secondary methods:
+              - local generic semantic parser
+              - exact legacy Gaza labels/cards
               """
               output = {}
 
@@ -1406,15 +1755,25 @@ jobs:
 
                   candidates = []
 
-                  # Primary generic semantic parser.
+                  # Main section-based parser.
                   candidates.extend(
-                      semantic_page_pairs(
+                      semantic_gaza_section_pairs(
                           words,
                           lines,
                       )
                   )
 
-                  # Conservative fallback for known explicit Gaza labels/cards.
+                  # If section parser does not resolve a pair, try local
+                  # semantic proximity.
+                  if not candidates:
+                      candidates.extend(
+                          semantic_page_pairs(
+                              words,
+                              lines,
+                          )
+                      )
+
+                  # Final conservative legacy fallback.
                   if not candidates:
                       candidates.extend(
                           spatial_early_labels(
@@ -1792,15 +2151,16 @@ jobs:
                   "method": (
                       "Issue number and date come from WHO's official "
                       "Emergency Situation Reports archive. Every PDF page is "
-                      "scanned semantically for casualty labels such as killed, "
-                      "fatalities, deaths, injured, injuries, or wounded. The "
-                      "nearest plausible numbers are accepted only when the "
-                      "surrounding visual section is clearly about Gaza; nearby "
-                      "Ministry of Health attribution increases confidence. "
-                      "Competing plausible pairs cause the report to be rejected. "
-                      "Older exact-layout rules are fallback only. Previously "
-                      "verified WHO-only records are preserved. No OCR, "
-                      "interpolation, OCHA fallback, or inferred totals."
+                      "split into visual sections, and the full Gaza section is "
+                      "isolated before casualty extraction. Within that section, "
+                      "labels such as killed, fatalities, deaths, injured, "
+                      "injuries, or wounded may be separated from their numbers "
+                      "by multiple lines; candidates are ranked by visual relation "
+                      "within the same Gaza section. Ministry of Health attribution "
+                      "strengthens confidence. Local proximity and older exact-card "
+                      "rules are fallback only. Previously verified WHO-only records "
+                      "are preserved. No OCR, interpolation, OCHA fallback, or "
+                      "inferred totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
