@@ -1,0 +1,281 @@
+{
+  "updated_at": "2026-08-08",
+  "editorial_note": "Curated timeline of major legal decisions, investigations and reports. Summaries attribute findings to the issuing body. Inclusion does not mean the website independently adopts each legal conclusion.",
+  "records": [
+    {
+      "date": "2023-12-29",
+      "organization": "Republic of South Africa / International Court of Justice",
+      "type": "ICJ case filing",
+      "category": "Court",
+      "title": "South Africa institutes proceedings under the Genocide Convention",
+      "summary": "South Africa filed proceedings against Israel at the International Court of Justice, alleging violations of the Genocide Convention in Gaza and requesting urgent provisional measures.",
+      "finding": "This was an application containing South Africa’s allegations, not a judicial finding. The merits of the genocide case remain for the Court to determine.",
+      "url": "https://www.icj-cij.org/case/192",
+      "tags": [
+        "Genocide Convention",
+        "South Africa v. Israel",
+        "ICJ"
+      ]
+    },
+    {
+      "date": "2024-01-26",
+      "organization": "International Court of Justice",
+      "type": "Provisional measures order",
+      "category": "Court",
+      "title": "First provisional measures in South Africa v. Israel",
+      "summary": "The ICJ found that at least some of the rights claimed by South Africa under the Genocide Convention were plausible and that there was urgency and a risk of irreparable prejudice. It ordered Israel to take measures to prevent acts within Article II of the Genocide Convention, prevent and punish direct and public incitement, enable humanitarian assistance and preserve evidence.",
+      "finding": "The Court did not decide whether genocide had occurred. Provisional measures protect rights pending a later decision on jurisdiction and the merits.",
+      "url": "https://www.icj-cij.org/node/203447",
+      "tags": [
+        "ICJ",
+        "Provisional measures",
+        "Genocide Convention"
+      ]
+    },
+    {
+      "date": "2024-03-25",
+      "organization": "UN Special Rapporteur Francesca Albanese",
+      "type": "UN Special Rapporteur report",
+      "category": "UN",
+      "title": "Anatomy of a Genocide",
+      "summary": "The Special Rapporteur examined the conduct of Israel’s military campaign in Gaza through the legal framework of the Genocide Convention, including killing, serious harm, conditions of life and evidence relating to intent.",
+      "finding": "Albanese concluded that there were reasonable grounds to believe that the threshold indicating Israel’s commission of genocide was met.",
+      "url": "https://www.un.org/unispal/document/anatomy-of-a-genocide-report-of-the-special-rapporteur-on-the-situation-of-human-rights-in-the-palestinian-territory-occupied-since-1967-to-human-rights-council-advance-unedited-version-a-hrc-55/",
+      "tags": [
+        "Genocide",
+        "Special Rapporteur",
+        "A/HRC/55/73"
+      ]
+    },
+    {
+      "date": "2024-03-28",
+      "organization": "International Court of Justice",
+      "type": "Additional provisional measures",
+      "category": "Court",
+      "title": "ICJ orders additional humanitarian measures",
+      "summary": "Citing worsening living conditions, including famine and starvation, the ICJ reaffirmed its January order and required additional measures to ensure urgently needed basic services and humanitarian assistance at scale.",
+      "finding": "This was a binding provisional-measures order, not a final judgment on the genocide allegation.",
+      "url": "https://www.icj-cij.org/node/203847",
+      "tags": [
+        "ICJ",
+        "Humanitarian aid",
+        "Famine"
+      ]
+    },
+    {
+      "date": "2024-05-24",
+      "organization": "International Court of Justice",
+      "type": "Provisional measures order",
+      "category": "Court",
+      "title": "ICJ issues Rafah-related provisional measures",
+      "summary": "The Court reaffirmed its previous orders and ordered Israel to immediately halt its military offensive and other action in the Rafah Governorate that may inflict conditions of life on the Palestinian group in Gaza capable of bringing about its physical destruction in whole or in part.",
+      "finding": "The order concerned urgent provisional protection and did not determine the merits of South Africa’s genocide claim.",
+      "url": "https://www.icj-cij.org/node/204091",
+      "tags": [
+        "ICJ",
+        "Rafah",
+        "Provisional measures"
+      ]
+    },
+    {
+      "date": "2024-06-12",
+      "organization": "UN Independent International Commission of Inquiry",
+      "type": "Commission of Inquiry report",
+      "category": "UN",
+      "title": "Commission reports on violations since 7 October 2023",
+      "summary": "The Commission investigated the 7 October attacks in Israel and subsequent military operations in Gaza, examining violations by Hamas and other Palestinian armed groups as well as by Israeli authorities and security forces.",
+      "finding": "The Commission concluded that both sides committed war crimes. It also found Israeli authorities responsible for crimes against humanity, including extermination, murder, gender persecution and forcible transfer.",
+      "url": "https://undocs.org/A/HRC/56/26",
+      "tags": [
+        "Commission of Inquiry",
+        "War crimes",
+        "Crimes against humanity"
+      ]
+    },
+    {
+      "date": "2024-07-19",
+      "organization": "International Court of Justice",
+      "type": "Advisory opinion",
+      "category": "Court",
+      "title": "Legal consequences of Israel’s policies and practices in the occupied Palestinian territory",
+      "summary": "In a separate advisory proceeding requested by the UN General Assembly, the ICJ examined Israel’s prolonged occupation, settlements, annexation-related practices, discrimination and the Palestinian right to self-determination.",
+      "finding": "The Court concluded that Israel’s continued presence in the Occupied Palestinian Territory is unlawful and that it must bring that presence to an end as rapidly as possible, cease new settlement activity and provide reparation.",
+      "url": "https://www.icj-cij.org/index.php/node/204160",
+      "tags": [
+        "ICJ",
+        "Occupation",
+        "Advisory opinion"
+      ]
+    },
+    {
+      "date": "2024-10-01",
+      "organization": "UN Special Rapporteur Francesca Albanese",
+      "type": "UN Special Rapporteur report",
+      "category": "UN",
+      "title": "Genocide as colonial erasure",
+      "summary": "The report expanded Albanese’s earlier analysis beyond Gaza and situated post-7 October violence within a longer history of forced displacement, territorial expansion and settler colonialism.",
+      "finding": "Albanese characterized the destruction in Gaza as an ongoing genocide and argued that it should be understood within a broader process of colonial erasure of Palestinians.",
+      "url": "https://www.un.org/unispal/document/genocide-as-colonial-erasure-report-francesca-albanese-01oct24/",
+      "tags": [
+        "Genocide",
+        "Special Rapporteur",
+        "A/79/384"
+      ]
+    },
+    {
+      "date": "2024-11-21",
+      "organization": "International Criminal Court",
+      "type": "Arrest warrants",
+      "category": "Court",
+      "title": "ICC issues arrest warrants for Benjamin Netanyahu and Yoav Gallant",
+      "summary": "ICC Pre-Trial Chamber I issued arrest warrants for Israeli Prime Minister Benjamin Netanyahu and former Defence Minister Yoav Gallant in the Situation in the State of Palestine.",
+      "finding": "The Chamber found reasonable grounds to believe they bore criminal responsibility for alleged war crimes and crimes against humanity. The warrants are not convictions and did not charge genocide.",
+      "url": "https://www.icc-cpi.int/news/situation-state-palestine-icc-pre-trial-chamber-i-rejects-state-israels-challenges",
+      "tags": [
+        "ICC",
+        "Arrest warrants",
+        "War crimes",
+        "Crimes against humanity"
+      ]
+    },
+    {
+      "date": "2024-12-05",
+      "organization": "Amnesty International",
+      "type": "Human rights investigation",
+      "category": "Human rights",
+      "title": "You Feel Like You Are Subhuman: Israel’s Genocide Against Palestinians in Gaza",
+      "summary": "Amnesty examined civilian killings, destruction of civilian infrastructure, forcible displacement, obstruction of humanitarian assistance and restrictions on essential supplies, as well as statements by Israeli decision-makers.",
+      "finding": "Amnesty International concluded that Israel has committed and is continuing to commit genocide against Palestinians in Gaza.",
+      "url": "https://www.amnesty.org/en/documents/mde15/8668/2024/en/",
+      "tags": [
+        "Amnesty International",
+        "Genocide",
+        "Human rights"
+      ]
+    },
+    {
+      "date": "2024-12-19",
+      "organization": "Médecins Sans Frontières / Doctors Without Borders",
+      "type": "Medical humanitarian report",
+      "category": "Human rights",
+      "title": "Gaza: Life in a Death Trap",
+      "summary": "MSF documented repeated attacks on civilians, devastation of healthcare and other infrastructure, forced displacement, siege conditions, obstruction of humanitarian assistance and its teams’ first-hand medical observations.",
+      "finding": "MSF said its observations were consistent with descriptions by legal experts and organizations concluding that genocide was taking place, while stressing that MSF itself did not have the legal authority to establish genocidal intent.",
+      "url": "https://www.doctorswithoutborders.org/latest/gaza-death-trap-msf-report-exposes-israels-campaign-total-destruction",
+      "tags": [
+        "MSF",
+        "Healthcare",
+        "Ethnic cleansing",
+        "Genocide"
+      ]
+    },
+    {
+      "date": "2024-12-19",
+      "organization": "Human Rights Watch",
+      "type": "Human rights investigation",
+      "category": "Human rights",
+      "title": "Extermination and Acts of Genocide",
+      "summary": "Human Rights Watch investigated Israel’s deprivation of adequate water to Palestinians in Gaza, including restrictions on water, electricity and fuel and damage or destruction of water and sanitation infrastructure.",
+      "finding": "HRW concluded that Israeli authorities committed the crime against humanity of extermination and acts of genocide. It said the documented pattern and statements may also support an inference of genocidal intent and therefore may amount to the crime of genocide.",
+      "url": "https://www.hrw.org/report/2024/12/19/extermination-and-acts-genocide/israel-deliberately-depriving-palestinians-gaza",
+      "tags": [
+        "Human Rights Watch",
+        "Extermination",
+        "Water",
+        "Genocide"
+      ]
+    },
+    {
+      "date": "2025-07-28",
+      "organization": "B’Tselem",
+      "type": "Israeli human rights organization report",
+      "category": "Human rights",
+      "title": "Our Genocide",
+      "summary": "The Israeli human rights organization examined mass killing, destruction of conditions of life, forced displacement, detention and abuse, destruction of institutions and statements by senior Israeli political and military officials.",
+      "finding": "B’Tselem concluded that Israel is taking coordinated, deliberate action to destroy Palestinian society in the Gaza Strip and characterized the conduct as genocide.",
+      "url": "https://www.btselem.org/publications/202507_our_genocide",
+      "tags": [
+        "B’Tselem",
+        "Israeli NGO",
+        "Genocide"
+      ]
+    },
+    {
+      "date": "2025-08-31",
+      "organization": "International Association of Genocide Scholars",
+      "type": "Scholarly association resolution",
+      "category": "Scholars",
+      "title": "IAGS Resolution on Gaza",
+      "summary": "The International Association of Genocide Scholars adopted a resolution following its standard member-resolution process. The association reported that 28% of members voted and 86% of participating voters supported the resolution.",
+      "finding": "The resolution stated that Israel’s policies and actions in Gaza meet the legal definition of genocide in Article II of the Genocide Convention.",
+      "url": "https://genocidescholars.org/publications/resolutions/",
+      "tags": [
+        "IAGS",
+        "Genocide scholars",
+        "Resolution"
+      ]
+    },
+    {
+      "date": "2025-09-16",
+      "organization": "UN Independent International Commission of Inquiry",
+      "type": "Commission of Inquiry legal analysis",
+      "category": "UN",
+      "title": "Legal analysis of the conduct of Israel in Gaza under the Genocide Convention",
+      "summary": "The Commission carried out a dedicated legal analysis of Israeli authorities’ and security forces’ conduct in Gaza since October 2023 under the Genocide Convention.",
+      "finding": "The Commission concluded on reasonable grounds that Israeli authorities and security forces committed and continued to commit genocide, and that the State of Israel bears responsibility for failure to prevent genocide, commission of genocide and failure to punish genocide.",
+      "url": "https://www.un.org/unispal/document/commission-of-inquiry-report-genocide-in-gaza-a-hrc-60-crp-3/",
+      "tags": [
+        "Commission of Inquiry",
+        "Genocide",
+        "A/HRC/60/CRP.3"
+      ]
+    },
+    {
+      "date": "2025-10-20",
+      "organization": "UN Special Rapporteur Francesca Albanese",
+      "type": "UN Special Rapporteur report",
+      "category": "UN",
+      "title": "Gaza Genocide: a collective crime",
+      "summary": "The report focused on the role of third States, diplomatic protection, military assistance, economic relationships and other forms of support in sustaining Israel’s conduct in Gaza.",
+      "finding": "Albanese described the ongoing genocide in Gaza as a collective crime and argued that influential third States had enabled it through participation, aid, assistance and diplomatic protection.",
+      "url": "https://www.un.org/unispal/document/special-rapporteur-report-gaza-genocide-a-collective-crime-20oct25/",
+      "tags": [
+        "Special Rapporteur",
+        "Genocide",
+        "State complicity"
+      ]
+    },
+    {
+      "date": "2026-02-19",
+      "organization": "UN Special Rapporteur Francesca Albanese",
+      "type": "UN Special Rapporteur report",
+      "category": "UN",
+      "title": "Torture and genocide",
+      "summary": "The Special Rapporteur examined custodial and non-custodial torture of Palestinians since 7 October 2023, drawing on testimony, legal analysis and public sources. The advance version was dated in February and the UN publication page was released in March 2026.",
+      "finding": "Albanese concluded that systematic torture had become an integral component of what she characterized as the ongoing genocide and that the practices analysed met the threshold for genocide under the Genocide Convention.",
+      "url": "https://www.ohchr.org/en/documents/country-reports/ahrc6171-torture-and-genocide-report-special-rapporteur-situation-human",
+      "tags": [
+        "Torture",
+        "Genocide",
+        "Special Rapporteur",
+        "A/HRC/61/71"
+      ]
+    },
+    {
+      "date": "2026-06-18",
+      "organization": "UN Independent International Commission of Inquiry",
+      "type": "Commission of Inquiry report",
+      "category": "UN",
+      "title": "The essence of childhood has been destroyed",
+      "summary": "The Commission examined violations and crimes against Palestinian children since 7 October 2023, including killing and injury, detention and torture, sexual violence, displacement, starvation and the collapse of education and healthcare.",
+      "finding": "The Commission concluded that Israeli authorities and security forces deliberately targeted Palestinian children and that this conduct contributed to continuing genocide, crimes against humanity and war crimes in Gaza.",
+      "url": "https://www.un.org/unispal/document/coi-report-23jun26/",
+      "tags": [
+        "Children",
+        "Commission of Inquiry",
+        "Genocide",
+        "A/HRC/62/CRP.2"
+      ]
+    }
+  ]
+}
