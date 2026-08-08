@@ -43,7 +43,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 23
+          VERSION = 24
 
           ARCHIVES = [
               # Canonical WHO Gaza Emergency Situation Reports archive.
@@ -1954,47 +1954,151 @@ jobs:
 
           def parse_early_table(texts):
               """
-              WHO early template:
-                  Number of people killed in Gaza
-                  Number of people injured in Gaza
-              Values are paired only with those explicit Gaza labels.
+              WHO early summary-table family.
+
+              Find the exact Gaza killed and Gaza injured labels, then inspect
+              only a compact local window around each label. This avoids
+              picking West Bank, health-worker, attack, or facility counts
+              elsewhere in the same summary table.
               """
-              all_pairs = {}
-
-              killed_label = (
+              killed_label = re.compile(
                   r"(?:Estimated\s+number\s+of\s+)?"
-                  r"(?:people|Palestinians?)\s+killed\s+in\s+Gaza"
+                  r"(?:people|Palestinians?)\s+"
+                  r"killed\s+in\s+Gaza",
+                  re.I,
               )
-              injured_label = (
+              injured_label = re.compile(
                   r"(?:Estimated\s+number\s+of\s+)?"
-                  r"(?:people|Palestinians?)\s+injured\s+in\s+Gaza"
+                  r"(?:people|Palestinians?)\s+"
+                  r"injured\s+in\s+Gaza",
+                  re.I,
               )
 
-              for mode, flat in normalized_views(texts):
-                  killed = nearest_number_before_or_after(
+              found = {}
+
+              def local_values(
+                  flat,
+                  pattern,
+                  minimum,
+                  maximum,
+              ):
+                  values = []
+
+                  for match in pattern.finditer(
+                      flat
+                  ):
+                      # Tight local window around the exact Gaza label.
+                      before = flat[
+                          max(
+                              0,
+                              match.start() - 75,
+                          ):
+                          match.start()
+                      ]
+                      after = flat[
+                          match.end():
+                          min(
+                              len(flat),
+                              match.end() + 75,
+                          )
+                      ]
+
+                      candidates = []
+
+                      for m in re.finditer(
+                          NUM,
+                          before,
+                      ):
+                          value = n(
+                              m.group(0)
+                          )
+                          distance = (
+                              len(before)
+                              - m.end()
+                          )
+
+                          if (
+                              minimum
+                              <= value
+                              <= maximum
+                          ):
+                              candidates.append(
+                                  (
+                                      distance,
+                                      value,
+                                  )
+                              )
+
+                      for m in re.finditer(
+                          NUM,
+                          after,
+                      ):
+                          value = n(
+                              m.group(0)
+                          )
+                          distance = m.start()
+
+                          if (
+                              minimum
+                              <= value
+                              <= maximum
+                          ):
+                              candidates.append(
+                                  (
+                                      distance,
+                                      value,
+                                  )
+                              )
+
+                      candidates.sort(
+                          key=lambda item: item[0]
+                      )
+
+                      if candidates:
+                          # Keep only the nearest value for this exact label.
+                          values.append(
+                              candidates[0]
+                          )
+
+                  return values
+
+              for mode, flat in normalized_views(
+                  texts
+              ):
+                  killed = local_values(
                       flat,
                       killed_label,
                       100,
                       500000,
-                      130,
                   )
-                  injured = nearest_number_before_or_after(
+                  injured = local_values(
                       flat,
                       injured_label,
                       100,
                       1000000,
-                      130,
                   )
 
                   for kd, k in killed:
                       for idist, i in injured:
-                          if not valid(k, i):
+                          if not valid(
+                              k,
+                              i,
+                          ):
                               continue
 
-                          # The pair with closest label-number relationships
-                          # is preferred, but duplicate same pair is fine.
-                          score = kd + idist
-                          all_pairs.setdefault(
+                          # Gaza cumulative injury totals should be materially
+                          # above killed totals. This rejects many small
+                          # neighboring card values without imposing a war-
+                          # specific numeric threshold.
+                          if i < k * 1.15:
+                              continue
+
+                          score = (
+                              kd
+                              + idist
+                          )
+
+                          found.setdefault(
                               (k, i),
                               [],
                           ).append(
@@ -2004,31 +2108,43 @@ jobs:
                               )
                           )
 
-              if not all_pairs:
+              if not found:
                   return {}
 
               ranked = sorted(
                   (
-                      min(score for score, _ in entries),
+                      min(
+                          score
+                          for score, _
+                          in entries
+                      ),
                       pair,
                       entries,
                   )
-                  for pair, entries in all_pairs.items()
+                  for pair, entries
+                  in found.items()
               )
 
-              if (
-                  len(ranked) > 1
-                  and ranked[1][0] - ranked[0][0] < 12
-                  and ranked[1][1] != ranked[0][1]
-              ):
-                  return {}
+              # Only one clearly best pair may be accepted.
+              if len(ranked) > 1:
+                  if (
+                      ranked[1][0]
+                      - ranked[0][0]
+                      < 18
+                      and ranked[1][1]
+                      != ranked[0][1]
+                  ):
+                      return {}
 
-              _, pair, entries = ranked[0]
+              _, pair, entries = ranked[
+                  0
+              ]
 
               return {
                   pair: {
                       method
-                      for _, method in entries
+                      for _, method
+                      in entries
                   }
               }
 
@@ -2343,35 +2459,115 @@ jobs:
                       (mode, content)
                   )
 
-              # First classify the report from its own content and use
-              # the deterministic parser for that layout family.
+              # Classify the report from its own content.
               detected_layout, layout_pairs = parse_by_layout(
                   usable_texts
               )
 
+              # Always define both fallback parsers so later corroboration
+              # code cannot reference an uninitialized local variable.
+              text_pairs = parse_known_layouts(
+                  usable_texts
+              )
+              spatial_pairs = spatial_parse(
+                  pdf_bytes
+              )
+
               if layout_pairs:
-                  all_pairs = layout_pairs
-              else:
-                  # Generic spatial Gaza-section parser is fallback.
-                  spatial_pairs = spatial_parse(
-                      pdf_bytes
-                  )
+                  # Deterministic layout parser wins. Other parsers may only
+                  # corroborate the exact same pair.
+                  all_pairs = {
+                      pair: set(methods)
+                      for pair, methods in layout_pairs.items()
+                  }
 
-                  # Strict raw/layout semantic parser is final fallback.
-                  text_pairs = parse_known_layouts(
-                      usable_texts
-                  )
-
-                  if spatial_pairs:
-                      all_pairs = spatial_pairs
-
-                      # Only corroborate identical pair; don't introduce
-                      # competing values from another parser.
-                      for pair, methods in text_pairs.items():
+                  for source_pairs in (
+                      spatial_pairs,
+                      text_pairs,
+                  ):
+                      for pair, methods in source_pairs.items():
                           if pair in all_pairs:
                               all_pairs[pair].update(
                                   methods
                               )
+
+              elif detected_layout != "GENERIC":
+                  # A recognized WHO layout was detected but its deterministic
+                  # parser could not resolve one unambiguous pair. Do NOT let a
+                  # generic parser substitute a weak unrelated pair from the
+                  # same page (for example small health-attack counts).
+                  #
+                  # We accept a fallback only if spatial and text extraction
+                  # independently agree on exactly the same casualty pair.
+                  agreed = (
+                      set(spatial_pairs)
+                      & set(text_pairs)
+                  )
+
+                  if len(agreed) == 1:
+                      pair = next(iter(agreed))
+                      methods = set()
+                      methods.update(
+                          spatial_pairs.get(
+                              pair,
+                              set(),
+                          )
+                      )
+                      methods.update(
+                          text_pairs.get(
+                              pair,
+                              set(),
+                          )
+                      )
+                      methods.add(
+                          "recognized-layout-fallback-agreement"
+                      )
+                      all_pairs = {
+                          pair: methods
+                      }
+                  else:
+                      all_pairs = {}
+
+              else:
+                  # Truly unknown layout: use generic spatial parser first,
+                  # then strict text fallback. If both produce different
+                  # plausible pairs, reject rather than choose.
+                  if (
+                      spatial_pairs
+                      and text_pairs
+                  ):
+                      agreed = (
+                          set(spatial_pairs)
+                          & set(text_pairs)
+                      )
+
+                      if len(agreed) == 1:
+                          pair = next(iter(agreed))
+                          methods = set()
+                          methods.update(
+                              spatial_pairs[
+                                  pair
+                              ]
+                          )
+                          methods.update(
+                              text_pairs[
+                                  pair
+                              ]
+                          )
+                          all_pairs = {
+                              pair: methods
+                          }
+                      elif (
+                          len(spatial_pairs) == 1
+                          and not text_pairs
+                      ):
+                          all_pairs = spatial_pairs
+                      else:
+                          all_pairs = {}
+
+                  elif spatial_pairs:
+                      all_pairs = spatial_pairs
+
                   else:
                       all_pairs = text_pairs
 
