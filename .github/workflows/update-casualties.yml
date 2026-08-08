@@ -43,7 +43,7 @@ jobs:
           from bs4 import BeautifulSoup
 
           OUT = Path("data/casualty-timeline.json")
-          VERSION = 17
+          VERSION = 18
 
           ARCHIVES = [
               # Canonical WHO Gaza Emergency Situation Reports archive.
@@ -398,8 +398,8 @@ jobs:
 
           def report_text_views(pdf_bytes):
               """
-              Pages 1-4 in both layout and raw reading order.
-              Spatial parsing remains primary; this is strict fallback only.
+              Entire PDF in both layout and raw modes for strict fallback.
+              Spatial parsing remains primary.
               """
               outputs = []
 
@@ -408,12 +408,10 @@ jobs:
                   pdf.write_bytes(pdf_bytes)
 
                   for mode in ("layout", "raw"):
-                      txt = Path(folder) / f"pages-{mode}.txt"
+                      txt = Path(folder) / f"report-{mode}.txt"
 
                       command = [
                           "pdftotext",
-                          "-f", "1",
-                          "-l", "4",
                       ]
 
                       command.append(
@@ -659,10 +657,12 @@ jobs:
               except Exception:
                   return None
 
-          def spatial_pages(pdf_bytes, max_pages=4):
+          def spatial_pages(pdf_bytes):
               """
-              Extract positioned words from pages 1-4 independently.
-              Some WHO issues place the Gaza overview after page 1.
+              Extract positioned words from every page independently.
+
+              WHO sometimes places Gaza after West Bank or general sections,
+              so limiting the parser to the first few pages loses valid issues.
               """
               with tempfile.NamedTemporaryFile(
                   suffix=".pdf",
@@ -675,19 +675,23 @@ jobs:
 
               try:
                   with pdfplumber.open(tmp_path) as pdf:
-                      for page_index, page in enumerate(
-                          pdf.pages[:max_pages]
-                      ):
+                      for page_index, page in enumerate(pdf.pages):
+                          words = page.extract_words(
+                              x_tolerance=2,
+                              y_tolerance=3,
+                              keep_blank_chars=False,
+                              use_text_flow=False,
+                          ) or []
+
                           output.append({
                               "page": page_index + 1,
-                              "words": page.extract_words(
-                                  x_tolerance=2,
-                                  y_tolerance=3,
-                                  keep_blank_chars=False,
-                                  use_text_flow=False,
-                              ) or [],
+                              "width": float(page.width),
+                              "height": float(page.height),
+                              "words": words,
                           })
+
                   return output
+
               finally:
                   try:
                       Path(tmp_path).unlink()
@@ -894,9 +898,15 @@ jobs:
 
           def spatial_overview_cards(words, lines):
               """
-              Locate the WHO Gaza overview region first, then the Fatalities and
-              Injuries cards inside it. This prevents health-attack/subgroup
-              figures elsewhere on page 1 from being considered.
+              Parse only the Gaza Strip section that is explicitly tied to
+              'Source: Ministry of Health'.
+
+              Handles:
+              - value above label
+              - value below label
+              - value and label on same row
+              - Fatalities/Injuries cards side-by-side
+              - cards stacked vertically
               """
               gaza_lines = find_label_lines(
                   lines,
@@ -911,102 +921,164 @@ jobs:
               if not gaza_lines or not source_lines:
                   return []
 
-              # Choose source line closest below a Gaza Strip heading.
-              regions = []
+              results = []
 
               for gaza in gaza_lines:
+                  gx = center_x(gaza)
+
+                  nearby_sources = []
+
                   for source in source_lines:
-                      delta = source["top"] - gaza["top"]
-                      if 0 <= delta <= 260:
-                          regions.append(
-                              (delta, gaza, source)
+                      sx = center_x(source)
+                      dy = abs(source["top"] - gaza["top"])
+                      dx = abs(sx - gx)
+
+                      # Be generous spatially but still require the source label
+                      # to belong to the same broad Gaza panel.
+                      if dy <= 520 and dx <= 360:
+                          nearby_sources.append(
+                              (dy + dx * 0.35, source)
                           )
 
-              if not regions:
-                  return []
-
-              regions.sort(
-                  key=lambda item: item[0]
-              )
-              _, gaza, source = regions[0]
-
-              top_min = max(
-                  0,
-                  gaza["top"] - 30,
-              )
-              top_max = source["top"] + 260
-
-              scoped_lines = [
-                  line
-                  for line in lines
-                  if top_min <= line["top"] <= top_max
-              ]
-
-              fatalities = find_label_lines(
-                  scoped_lines,
-                  r"\b(?:Reported\s+)?Fatalit(?:y|ies)\b",
-              )
-              injuries = find_label_lines(
-                  scoped_lines,
-                  r"\b(?:Reported\s+)?Injur(?:y|ies)\b",
-              )
-
-              nums = [
-                  num
-                  for num in numeric_words(words)
-                  if (
-                      top_min - 40
-                      <= num["top"]
-                      <= top_max + 40
-                  )
-              ]
-
-              pairs = []
-
-              for fl in fatalities:
-                  killed = nearest_card_number(
-                      fl,
-                      nums,
-                      100,
-                      500000,
-                  )
-
-                  if killed is None:
+                  if not nearby_sources:
                       continue
 
-                  for il in injuries:
-                      injured = nearest_card_number(
-                          il,
-                          nums,
-                          100,
-                          1000000,
+                  nearby_sources.sort(
+                      key=lambda item: item[0]
+                  )
+
+                  for _, source in nearby_sources[:2]:
+                      top_min = max(
+                          0,
+                          min(gaza["top"], source["top"]) - 80,
+                      )
+                      top_max = max(
+                          gaza["bottom"], source["bottom"]
+                      ) + 620
+
+                      # Build a candidate section around the Gaza heading/source.
+                      scoped_lines = [
+                          line
+                          for line in lines
+                          if top_min <= line["top"] <= top_max
+                      ]
+
+                      # Stop at the next major territorial/health section.
+                      stops = []
+
+                      for line in scoped_lines:
+                          if line["top"] <= max(
+                              gaza["bottom"],
+                              source["bottom"],
+                          ) + 30:
+                              continue
+
+                          if re.search(
+                              r"\b(?:West\s+Bank|Israel|Lebanon|"
+                              r"Health\s+Facility|Health\s+Care|"
+                              r"Health\s+Attacks|Hospitals?|PHCCs?|"
+                              r"Medical\s+Evacuation|Nutrition|"
+                              r"Communicable\s+Diseases)\b",
+                              line["text"],
+                              re.I,
+                          ):
+                              stops.append(line["top"])
+
+                      if stops:
+                          top_max = min(stops)
+                          scoped_lines = [
+                              line
+                              for line in scoped_lines
+                              if line["top"] < top_max
+                          ]
+
+                      fatalities = find_label_lines(
+                          scoped_lines,
+                          r"\b(?:Reported\s+)?Fatalit(?:y|ies)\b",
+                      )
+                      injuries = find_label_lines(
+                          scoped_lines,
+                          r"\b(?:Reported\s+)?Injur(?:y|ies)\b",
                       )
 
-                      if (
-                          injured is not None
-                          and valid(killed, injured)
-                      ):
-                          pairs.append(
-                              (
-                                  killed,
-                                  injured,
-                                  "spatial-gaza-overview",
-                              )
+                      nums = [
+                          num
+                          for num in numeric_words(words)
+                          if (
+                              top_min - 60
+                              <= num["top"]
+                              <= top_max + 60
+                          )
+                      ]
+
+                      if not fatalities or not injuries:
+                          continue
+
+                      for fl in fatalities:
+                          killed = nearest_card_number(
+                              fl,
+                              nums,
+                              100,
+                              500000,
                           )
 
-              return pairs
+                          if killed is None:
+                              # Same-line fallback for layouts where the
+                              # number and label are rendered in one text row.
+                              for m in re.finditer(
+                                  rf"(?P<n>{NUM})\s+"
+                                  rf"(?:Reported\s+)?Fatalit(?:y|ies)\b",
+                                  fl["text"],
+                                  re.I,
+                              ):
+                                  killed = n(m.group("n"))
+                                  break
+
+                          if killed is None:
+                              continue
+
+                          for il in injuries:
+                              injured = nearest_card_number(
+                                  il,
+                                  nums,
+                                  100,
+                                  1000000,
+                              )
+
+                              if injured is None:
+                                  for m in re.finditer(
+                                      rf"(?P<n>{NUM})\s+"
+                                      rf"(?:Reported\s+)?Injur(?:y|ies)\b",
+                                      il["text"],
+                                      re.I,
+                                  ):
+                                      injured = n(m.group("n"))
+                                      break
+
+                              if (
+                                  injured is not None
+                                  and valid(killed, injured)
+                              ):
+                                  results.append(
+                                      (
+                                          killed,
+                                          injured,
+                                          "spatial-gaza-overview",
+                                      )
+                                  )
+
+              return results
 
           def spatial_parse(pdf_bytes):
               """
-              Search pages 1-4 separately. A killed/injured pair must be
-              supported by one page; values are never combined across pages.
+              Scan all pages independently.
+
+              Never combine killed/injured values across pages. If exactly one
+              Gaza/MoH pair is found anywhere in the report, accept it.
               """
               output = {}
 
-              for page_info in spatial_pages(
-                  pdf_bytes,
-                  max_pages=4,
-              ):
+              for page_info in spatial_pages(pdf_bytes):
                   words = page_info["words"]
 
                   if not words:
@@ -1342,13 +1414,19 @@ jobs:
                   "previously verified WHO records preserved",
               )
 
+              missing = sorted(
+                  set(int(meta["issue"]) for meta in metas)
+                  - set(int(row["issue"]) for row in rows)
+              )
+
+              print(
+                  "Missing/unparsed WHO issues:",
+                  ", ".join(map(str, missing))
+                  if missing else "none",
+              )
+
               # Safety gate: never overwrite the timeline with a sparse parse.
               if len(rows) < 35:
-                  missing = sorted(
-                      set(meta["issue"] for meta in metas)
-                      - set(row["issue"] for row in rows)
-                  )
-
                   raise RuntimeError(
                       "Only "
                       + str(len(rows))
@@ -1381,14 +1459,14 @@ jobs:
                   ),
                   "method": (
                       "Issue number and date come from WHO's official "
-                      "Emergency Situation Reports archive. Pages 1-4 are "
-                      "parsed spatially so values stay attached to WHO's "
-                      "Gaza-specific Fatalities/Injuries cards or explicit "
-                      "killed/injured-in-Gaza labels. Raw/layout text is a "
-                      "strict fallback. Previously verified WHO-only records "
-                      "are preserved when a later parse temporarily misses an "
-                      "issue. No OCR, interpolation, OCHA fallback, or inferred "
-                      "totals."
+                      "Emergency Situation Reports archive. Every PDF page is "
+                      "scanned spatially until a Gaza Strip section explicitly "
+                      "tied to 'Source: Ministry of Health' is found. Both "
+                      "vertical and horizontal Fatalities/Injuries card layouts "
+                      "are supported. Raw/layout text is a strict fallback. "
+                      "Previously verified WHO-only records are preserved when "
+                      "a later parse temporarily misses an issue. No OCR, "
+                      "interpolation, OCHA fallback, or inferred totals."
                   ),
                   "updated_at": datetime.now(
                       timezone.utc
