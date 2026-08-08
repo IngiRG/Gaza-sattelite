@@ -1,29 +1,19 @@
 {
   "source": "WHO Eastern Mediterranean Regional Office Gaza emergency situation reports",
   "underlying_source": "Gaza Ministry of Health, as labelled by WHO",
-  "method": "Issue number and date come from WHO's official Emergency Situation Reports archive. Every PDF page is scanned semantically for casualty labels such as killed, fatalities, deaths, injured, injuries, or wounded. The nearest plausible numbers are accepted only when the surrounding visual section is clearly about Gaza; nearby Ministry of Health attribution increases confidence. Competing plausible pairs cause the report to be rejected. Older exact-layout rules are fallback only. Previously verified WHO-only records are preserved. No OCR, interpolation, OCHA fallback, or inferred totals.",
-  "updated_at": "2026-08-08T00:52:17.235178+00:00",
-  "parser_version": 20,
+  "method": "Issue number and date come from WHO's official Emergency Situation Reports archive. Every PDF page is split into visual sections, and the full Gaza section is isolated before casualty extraction. Within that section, labels such as killed, fatalities, deaths, injured, injuries, or wounded may be separated from their numbers by multiple lines; candidates are ranked by visual relation within the same Gaza section. Ministry of Health attribution strengthens confidence. Local proximity and older exact-card rules are fallback only. Previously verified WHO-only records are preserved. No OCR, interpolation, OCHA fallback, or inferred totals.",
+  "updated_at": "2026-08-08T01:05:24.837906+00:00",
+  "parser_version": 21,
   "records": [
     {
-      "date": "2023-10-15",
-      "killed": 111,
-      "injured": 380,
-      "source_url": "https://www.emro.who.int/images/stories/palestine/oPt-emegency-situation-report-issue_4.pdf",
-      "series_label": "WHO Emergency Situation Report #4",
+      "date": "2023-10-10",
+      "killed": 900,
+      "injured": 2616,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/oPt-emegency-situation-report-issue_2.pdf",
+      "series_label": "WHO Emergency Situation Report #2",
       "source_type": "WHO EMRO",
-      "issue": 4,
-      "parser_version": 20
-    },
-    {
-      "date": "2023-10-18",
-      "killed": 283,
-      "injured": 471,
-      "source_url": "https://www.emro.who.int/images/stories/palestine/oPt-emegency-situation-report-issue_5.pdf",
-      "series_label": "WHO Emergency Situation Report #5",
-      "source_type": "WHO EMRO",
-      "issue": 5,
-      "parser_version": 20
+      "issue": 2,
+      "parser_version": 21
     },
     {
       "date": "2023-11-15",
@@ -33,7 +23,7 @@
       "series_label": "WHO Emergency Situation Report #13",
       "source_type": "WHO EMRO",
       "issue": 13,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2023-11-29",
@@ -43,7 +33,7 @@
       "series_label": "WHO Emergency Situation Report #15",
       "source_type": "WHO EMRO",
       "issue": 15,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2023-12-07",
@@ -53,7 +43,7 @@
       "series_label": "WHO Emergency Situation Report #16",
       "source_type": "WHO EMRO",
       "issue": 16,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2023-12-14",
@@ -63,7 +53,7 @@
       "series_label": "WHO Emergency Situation Report #17",
       "source_type": "WHO EMRO",
       "issue": 17,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2023-12-23",
@@ -73,7 +63,7 @@
       "series_label": "WHO Emergency Situation Report #18",
       "source_type": "WHO EMRO",
       "issue": 18,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2023-12-29",
@@ -83,7 +73,7 @@
       "series_label": "WHO Emergency Situation Report #19",
       "source_type": "WHO EMRO",
       "issue": 19,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-01-11",
@@ -93,7 +83,7 @@
       "series_label": "WHO Emergency Situation Report #20",
       "source_type": "WHO EMRO",
       "issue": 20,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-01-22",
@@ -103,7 +93,7 @@
       "series_label": "WHO Emergency Situation Report #21",
       "source_type": "WHO EMRO",
       "issue": 21,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-01-30",
@@ -113,7 +103,7 @@
       "series_label": "WHO Emergency Situation Report #22",
       "source_type": "WHO EMRO",
       "issue": 22,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-02-20",
@@ -123,7 +113,47 @@
       "series_label": "WHO Emergency Situation Report #23",
       "source_type": "WHO EMRO",
       "issue": 23,
-      "parser_version": 20
+      "parser_version": 21
+    },
+    {
+      "date": "2024-03-03",
+      "killed": 30534,
+      "injured": 71920,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_24.pdf",
+      "series_label": "WHO Emergency Situation Report #24",
+      "source_type": "WHO EMRO",
+      "issue": 24,
+      "parser_version": 21
+    },
+    {
+      "date": "2024-03-25",
+      "killed": 32226,
+      "injured": 74518,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_26c.pdf",
+      "series_label": "WHO Emergency Situation Report #26",
+      "source_type": "WHO EMRO",
+      "issue": 26,
+      "parser_version": 21
+    },
+    {
+      "date": "2024-04-02",
+      "killed": 32975,
+      "injured": 75577,
+      "source_url": "https://www.emro.who.int/images/stories/Sitrep_-_issue_27.pdf",
+      "series_label": "WHO Emergency Situation Report #27",
+      "source_type": "WHO EMRO",
+      "issue": 27,
+      "parser_version": 21
+    },
+    {
+      "date": "2024-04-30",
+      "killed": 34568,
+      "injured": 77765,
+      "source_url": "https://www.emro.who.int/images/stories/palestine/Sit-rep-29.pdf",
+      "series_label": "WHO Emergency Situation Report #29",
+      "source_type": "WHO EMRO",
+      "issue": 29,
+      "parser_version": 21
     },
     {
       "date": "2024-06-06",
@@ -133,7 +163,7 @@
       "series_label": "WHO Emergency Situation Report #33",
       "source_type": "WHO EMRO",
       "issue": 33,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-07-15",
@@ -143,7 +173,7 @@
       "series_label": "WHO Emergency Situation Report #36",
       "source_type": "WHO EMRO",
       "issue": 36,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-07-22",
@@ -153,7 +183,7 @@
       "series_label": "WHO Emergency Situation Report #37",
       "source_type": "WHO EMRO",
       "issue": 37,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-07-29",
@@ -163,7 +193,7 @@
       "series_label": "WHO Emergency Situation Report #38",
       "source_type": "WHO EMRO",
       "issue": 38,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-08-05",
@@ -173,7 +203,7 @@
       "series_label": "WHO Emergency Situation Report #39",
       "source_type": "WHO EMRO",
       "issue": 39,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-08-20",
@@ -183,7 +213,7 @@
       "series_label": "WHO Emergency Situation Report #41",
       "source_type": "WHO EMRO",
       "issue": 41,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-09-18",
@@ -193,7 +223,7 @@
       "series_label": "WHO Emergency Situation Report #45",
       "source_type": "WHO EMRO",
       "issue": 45,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-09-25",
@@ -203,7 +233,7 @@
       "series_label": "WHO Emergency Situation Report #46",
       "source_type": "WHO EMRO",
       "issue": 46,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-10-02",
@@ -213,7 +243,7 @@
       "series_label": "WHO Emergency Situation Report #47",
       "source_type": "WHO EMRO",
       "issue": 47,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-10-15",
@@ -223,7 +253,7 @@
       "series_label": "WHO Emergency Situation Report #48",
       "source_type": "WHO EMRO",
       "issue": 48,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-11-06",
@@ -233,7 +263,7 @@
       "series_label": "WHO Emergency Situation Report #49",
       "source_type": "WHO EMRO",
       "issue": 49,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-11-13",
@@ -243,7 +273,7 @@
       "series_label": "WHO Emergency Situation Report #50",
       "source_type": "WHO EMRO",
       "issue": 50,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-11-20",
@@ -253,7 +283,7 @@
       "series_label": "WHO Emergency Situation Report #51",
       "source_type": "WHO EMRO",
       "issue": 51,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2024-12-04",
@@ -263,7 +293,7 @@
       "series_label": "WHO Emergency Situation Report #52",
       "source_type": "WHO EMRO",
       "issue": 52,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-01-08",
@@ -273,7 +303,7 @@
       "series_label": "WHO Emergency Situation Report #53",
       "source_type": "WHO EMRO",
       "issue": 53,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-02-01",
@@ -283,7 +313,7 @@
       "series_label": "WHO Emergency Situation Report #54",
       "source_type": "WHO EMRO",
       "issue": 54,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-02-14",
@@ -293,7 +323,7 @@
       "series_label": "WHO Emergency Situation Report #55",
       "source_type": "WHO EMRO",
       "issue": 55,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-02-28",
@@ -303,7 +333,7 @@
       "series_label": "WHO Emergency Situation Report #56",
       "source_type": "WHO EMRO",
       "issue": 56,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-03-14",
@@ -313,7 +343,7 @@
       "series_label": "WHO Emergency Situation Report #57",
       "source_type": "WHO EMRO",
       "issue": 57,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-05-07",
@@ -323,7 +353,7 @@
       "series_label": "WHO Emergency Situation Report #58",
       "source_type": "WHO EMRO",
       "issue": 58,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-05-20",
@@ -333,7 +363,7 @@
       "series_label": "WHO Emergency Situation Report #59",
       "source_type": "WHO EMRO",
       "issue": 59,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-06-17",
@@ -343,7 +373,7 @@
       "series_label": "WHO Emergency Situation Report #60",
       "source_type": "WHO EMRO",
       "issue": 60,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-06-30",
@@ -353,7 +383,7 @@
       "series_label": "WHO Emergency Situation Report #61",
       "source_type": "WHO EMRO",
       "issue": 61,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-08-07",
@@ -363,7 +393,7 @@
       "series_label": "WHO Emergency Situation Report #62",
       "source_type": "WHO EMRO",
       "issue": 62,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-08-21",
@@ -373,7 +403,7 @@
       "series_label": "WHO Emergency Situation Report #63",
       "source_type": "WHO EMRO",
       "issue": 63,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-09-11",
@@ -383,7 +413,7 @@
       "series_label": "WHO Emergency Situation Report #64",
       "source_type": "WHO EMRO",
       "issue": 64,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-10-07",
@@ -393,7 +423,7 @@
       "series_label": "WHO Emergency Situation Report #65",
       "source_type": "WHO EMRO",
       "issue": 65,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2025-10-31",
@@ -403,7 +433,7 @@
       "series_label": "WHO Emergency Situation Report #66",
       "source_type": "WHO EMRO",
       "issue": 66,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2026-01-31",
@@ -413,7 +443,7 @@
       "series_label": "WHO Emergency Situation Report #67",
       "source_type": "WHO EMRO",
       "issue": 67,
-      "parser_version": 20
+      "parser_version": 21
     },
     {
       "date": "2026-03-31",
@@ -423,7 +453,7 @@
       "series_label": "WHO Emergency Situation Report #68",
       "source_type": "WHO EMRO",
       "issue": 68,
-      "parser_version": 20
+      "parser_version": 21
     }
   ]
 }
