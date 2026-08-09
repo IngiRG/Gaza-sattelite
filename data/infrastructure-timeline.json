@@ -2,7 +2,7 @@
   "source": "Tech for Palestine Infrastructure Damaged",
   "source_url": "https://data.techforpalestine.org/api/v3/infrastructure-damaged.min.json",
   "documentation_url": "https://data.techforpalestine.org/docs/infrastructure-damaged/",
-  "updated_at": "2026-08-08T13:17:11.692982+00:00",
+  "updated_at": "2026-08-09T13:25:46.922138+00:00",
   "method": "Explicit reported fields are preferred. If an explicit field is absent, the corresponding ext_ field supplied by Tech for Palestine is used. Reported flags are retained so the frontend can distinguish actual observations from continuous values.",
   "records": [
     {
