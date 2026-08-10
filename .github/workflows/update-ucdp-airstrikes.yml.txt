@@ -1,0 +1,672 @@
+name: Update UCDP airstrike map
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "40 13 * * 2"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install downloader
+        run: pip install requests beautifulsoup4
+
+      - name: Build UCDP airstrike timeline from public downloads
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import re
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          START = "2023-10-07"
+          DOWNLOADS = "https://ucdp.uu.se/downloads/"
+          HISTORY = "https://ucdp.uu.se/downloads/olddw.html"
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "GazaTimeline-UCDP-PublicDownloads/2.0",
+              "Accept": "*/*",
+          })
+
+          AIR_RE = re.compile(
+              r"\b("
+              r"air[\s-]?strike(?:s)?|"
+              r"air[\s-]?raid(?:s)?|"
+              r"aerial\s+(?:strike|strikes|attack|attacks|raid|raids|bombardment|bombardments)|"
+              r"drone[\s-]?(?:strike|strikes|attack|attacks)|"
+              r"warplane(?:s)?\s+(?:struck|strike|bombed|bomb|attacked|attack)|"
+              r"fighter[\s-]?jet(?:s)?\s+(?:struck|strike|bombed|bomb|attacked|attack)|"
+              r"aircraft\s+(?:struck|strike|bombed|bomb|attacked|attack)|"
+              r"bombed\s+from\s+the\s+air"
+              r")\b",
+              re.I,
+          )
+
+          def fetch_text(url):
+              r = session.get(url, timeout=90)
+              r.raise_for_status()
+              return r.text
+
+          def download_bytes(url):
+              r = session.get(url, timeout=180)
+              r.raise_for_status()
+              if len(r.content) < 100:
+                  raise RuntimeError(f"Suspiciously small download: {url}")
+              return r.content
+
+          def version_tuple(text):
+              nums = re.findall(r"\d+", text)
+              return tuple(int(n) for n in nums)
+
+          def discover_downloads():
+              """
+              Discover UCDP's current annual GED CSV zip and every available
+              Candidate monthly CSV for 2026.
+
+              Candidate monthly files are combined so January-May do not vanish
+              when a later monthly release is published.
+              """
+              current_html = fetch_text(DOWNLOADS)
+              history_html = fetch_text(HISTORY)
+
+              current = BeautifulSoup(current_html, "html.parser")
+              history = BeautifulSoup(history_html, "html.parser")
+
+              annual = []
+              candidates = []
+
+              for soup, page_url in (
+                  (current, DOWNLOADS),
+                  (history, HISTORY),
+              ):
+                  for a in soup.find_all("a", href=True):
+                      href = urljoin(page_url, a["href"])
+                      low = href.lower()
+
+                      # Annual GED zip, e.g. ged261-csv.zip
+                      if re.search(r"/downloads/ged/ged\d+-csv\.zip$", low):
+                          annual.append(href)
+
+                      # Candidate monthly CSV, e.g. GEDEvent_v26_0_6.csv
+                      m = re.search(
+                          r"/downloads/candidateged/"
+                          r"gedevent_v(26)_0_(\d+)\.csv$",
+                          low,
+                      )
+                      if m:
+                          candidates.append(href)
+
+              if not annual:
+                  # Official current URL as conservative fallback.
+                  annual = [
+                      "https://ucdp.uu.se/downloads/ged/ged261-csv.zip"
+                  ]
+
+              annual = sorted(
+                  set(annual),
+                  key=version_tuple,
+                  reverse=True,
+              )
+
+              candidates = sorted(
+                  set(candidates),
+                  key=version_tuple,
+              )
+
+              if not candidates:
+                  # Current public Candidate release fallback.
+                  candidates = [
+                      "https://ucdp.uu.se/downloads/candidateged/"
+                      "GEDEvent_v26_0_6.csv"
+                  ]
+
+              print("Annual GED:", annual[0])
+              print("Candidate monthly files:")
+              for url in candidates:
+                  print("  ", url)
+
+              return annual[0], candidates
+
+          def decode_csv_bytes(data):
+              for encoding in (
+                  "utf-8-sig",
+                  "utf-8",
+                  "latin-1",
+              ):
+                  try:
+                      return data.decode(encoding)
+                  except UnicodeDecodeError:
+                      pass
+              return data.decode("utf-8", errors="replace")
+
+          def rows_from_csv_bytes(data):
+              text = decode_csv_bytes(data)
+              sample = text[:10000]
+
+              try:
+                  dialect = csv.Sniffer().sniff(
+                      sample,
+                      delimiters=",;\t",
+                  )
+              except Exception:
+                  dialect = csv.excel
+
+              return list(
+                  csv.DictReader(
+                      io.StringIO(text),
+                      dialect=dialect,
+                  )
+              )
+
+          def read_annual_zip(url):
+              data = download_bytes(url)
+
+              with zipfile.ZipFile(
+                  io.BytesIO(data)
+              ) as z:
+                  csv_names = [
+                      n
+                      for n in z.namelist()
+                      if n.lower().endswith(".csv")
+                      and not n.startswith("__MACOSX")
+                  ]
+
+                  if not csv_names:
+                      raise RuntimeError(
+                          f"No CSV found inside {url}"
+                      )
+
+                  # Prefer the largest CSV, which is the event dataset rather
+                  # than documentation or auxiliary files.
+                  csv_names.sort(
+                      key=lambda n: z.getinfo(n).file_size,
+                      reverse=True,
+                  )
+
+                  name = csv_names[0]
+
+                  print(
+                      "Reading annual CSV:",
+                      name,
+                  )
+
+                  return rows_from_csv_bytes(
+                      z.read(name)
+                  )
+
+          def first(row, *names):
+              # Exact column name first.
+              for name in names:
+                  value = row.get(name)
+                  if value not in (
+                      None,
+                      "",
+                  ):
+                      return value
+
+              # Case-insensitive fallback.
+              lookup = {
+                  str(k).lower(): v
+                  for k, v in row.items()
+              }
+
+              for name in names:
+                  value = lookup.get(
+                      name.lower()
+                  )
+
+                  if value not in (
+                      None,
+                      "",
+                  ):
+                      return value
+
+              return None
+
+          def number(value, default=0):
+              try:
+                  if value in (
+                      None,
+                      "",
+                  ):
+                      return default
+                  return float(value)
+              except Exception:
+                  return default
+
+          def integer(value, default=0):
+              try:
+                  if value in (
+                      None,
+                      "",
+                  ):
+                      return default
+                  return int(float(value))
+              except Exception:
+                  return default
+
+          def event_date(row):
+              raw = first(
+                  row,
+                  "date_start",
+                  "date",
+                  "date_end",
+              )
+
+              if not raw:
+                  return None
+
+              raw = str(raw).strip()
+
+              # UCDP commonly uses YYYY-MM-DD.
+              m = re.search(
+                  r"\b(20\d{2})-(\d{2})-(\d{2})\b",
+                  raw,
+              )
+
+              if m:
+                  return m.group(0)
+
+              # Also tolerate DD/MM/YYYY.
+              m = re.search(
+                  r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b",
+                  raw,
+              )
+
+              if m:
+                  return (
+                      f"{m.group(3)}-"
+                      f"{int(m.group(2)):02d}-"
+                      f"{int(m.group(1)):02d}"
+                  )
+
+              return None
+
+          def israel_actor(row):
+              """
+              Require Israel to be coded as a conflict actor, not merely
+              mentioned in a source description.
+              """
+              actor_text = " | ".join(
+                  str(
+                      first(row, field)
+                      or ""
+                  )
+                  for field in (
+                      "side_a",
+                      "side_b",
+                      "dyad_name",
+                      "conflict_name",
+                  )
+              )
+
+              return bool(
+                  re.search(
+                      r"\bGovernment of Israel\b",
+                      actor_text,
+                      re.I,
+                  )
+              )
+
+          def source_text(row):
+              """
+              UCDP does not have a weapon-type variable. Search only textual
+              metadata fields supplied in the download.
+              """
+              possible = (
+                  "source_article",
+                  "source_headline",
+                  "source_original",
+                  "where_description",
+                  "event_clarity",
+              )
+
+              parts = []
+
+              for field in possible:
+                  value = first(
+                      row,
+                      field,
+                  )
+                  if value:
+                      parts.append(
+                          str(value)
+                      )
+
+              return " | ".join(
+                  parts
+              )
+
+          def explicit_air(row):
+              return bool(
+                  AIR_RE.search(
+                      source_text(row)
+                  )
+              )
+
+          def normalize(row, dataset):
+              lat = number(
+                  first(
+                      row,
+                      "latitude",
+                      "lat",
+                  ),
+                  None,
+              )
+              lon = number(
+                  first(
+                      row,
+                      "longitude",
+                      "lon",
+                  ),
+                  None,
+              )
+
+              if (
+                  lat is None
+                  or lon is None
+              ):
+                  return None
+
+              date = event_date(
+                  row
+              )
+
+              if not date:
+                  return None
+
+              return {
+                  "id": str(
+                      first(
+                          row,
+                          "id",
+                      )
+                      or ""
+                  ),
+                  "relid": first(
+                      row,
+                      "relid",
+                  ),
+                  "date": date,
+                  "date_end": first(
+                      row,
+                      "date_end",
+                  ),
+                  "lat": lat,
+                  "lon": lon,
+                  "location": (
+                      first(
+                          row,
+                          "where_coordinates",
+                      )
+                      or first(
+                          row,
+                          "where_description",
+                      )
+                  ),
+                  "country": first(
+                      row,
+                      "country",
+                  ),
+                  "where_prec": integer(
+                      first(
+                          row,
+                          "where_prec",
+                      ),
+                      None,
+                  ),
+                  "date_prec": integer(
+                      first(
+                          row,
+                          "date_prec",
+                      ),
+                      None,
+                  ),
+                  "best": integer(
+                      first(
+                          row,
+                          "best",
+                      ),
+                      0,
+                  ),
+                  "deaths_civilians": integer(
+                      first(
+                          row,
+                          "deaths_civilians",
+                      ),
+                      0,
+                  ),
+                  "side_a": first(
+                      row,
+                      "side_a",
+                  ),
+                  "side_b": first(
+                      row,
+                      "side_b",
+                  ),
+                  "dataset": dataset,
+              }
+
+          annual_url, candidate_urls = discover_downloads()
+
+          annual_rows = read_annual_zip(
+              annual_url
+          )
+
+          monthly_sets = []
+
+          for candidate_url in candidate_urls:
+              try:
+                  candidate_rows = rows_from_csv_bytes(
+                      download_bytes(
+                          candidate_url
+                      )
+                  )
+              except Exception as error:
+                  print(
+                      "Candidate download failed:",
+                      candidate_url,
+                      error,
+                  )
+                  continue
+
+              monthly_sets.append(
+                  (
+                      candidate_url,
+                      candidate_rows,
+                  )
+              )
+
+          if not monthly_sets:
+              raise RuntimeError(
+                  "No Candidate monthly CSV could be downloaded."
+              )
+
+          collected = {}
+          scanned = 0
+
+          sources = [
+              (
+                  "UCDP GED annual",
+                  annual_rows,
+              )
+          ] + [
+              (
+                  "UCDP Candidate "
+                  + url.rsplit("/", 1)[-1],
+                  rows,
+              )
+              for url, rows in monthly_sets
+          ]
+
+          for label, rows in sources:
+              kept_this_source = 0
+
+              for row in rows:
+                  scanned += 1
+
+                  date = event_date(
+                      row
+                  )
+
+                  if (
+                      not date
+                      or date < START
+                  ):
+                      continue
+
+                  if not israel_actor(
+                      row
+                  ):
+                      continue
+
+                  if not explicit_air(
+                      row
+                  ):
+                      continue
+
+                  item = normalize(
+                      row,
+                      label,
+                  )
+
+                  if not item:
+                      continue
+
+                  # relid is UCDP's best cross-release event identity.
+                  # Fall back to a stable compound key.
+                  key = (
+                      item.get(
+                          "relid"
+                      )
+                      or (
+                          f"{item['date']}|"
+                          f"{item['lat']:.5f}|"
+                          f"{item['lon']:.5f}|"
+                          f"{item.get('side_a')}|"
+                          f"{item.get('side_b')}"
+                      )
+                  )
+
+                  # Candidate data should supersede the older annual copy
+                  # only when it is a later duplicate. Either contains the
+                  # same UCDP event rather than a newly invented event.
+                  collected[
+                      key
+                  ] = item
+
+                  kept_this_source += 1
+
+              print(
+                  label,
+                  "rows:",
+                  len(rows),
+                  "classified:",
+                  kept_this_source,
+              )
+
+          events = sorted(
+              collected.values(),
+              key=lambda x: (
+                  x.get("date") or "",
+                  x.get("relid") or "",
+                  x.get("id") or "",
+              ),
+          )
+
+          if not events:
+              raise RuntimeError(
+                  "Classifier produced zero events. "
+                  "Refusing to overwrite existing map data."
+              )
+
+          output = {
+              "source": (
+                  "Uppsala Conflict Data Program "
+                  "(UCDP) public downloads"
+              ),
+              "license": "CC BY 4.0",
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "start_date": START,
+              "annual_download": annual_url,
+              "candidate_downloads": candidate_urls,
+              "method": {
+                  "actor_filter": (
+                      "Government of Israel must be coded as "
+                      "a UCDP conflict actor."
+                  ),
+                  "airstrike_filter": (
+                      "Conservative keyword classification of "
+                      "UCDP textual source/location metadata."
+                  ),
+                  "warning": (
+                      "UCDP has no dedicated weapon-type field. "
+                      "These are events explicitly described with "
+                      "selected aerial-strike terminology, not a "
+                      "complete census of Israeli airstrikes or "
+                      "munitions."
+                  ),
+              },
+              "scanned_records": scanned,
+              "classified_events": len(
+                  events
+              ),
+              "events": events,
+          }
+
+          Path("data").mkdir(
+              exist_ok=True
+          )
+
+          Path(
+              "data/ucdp-airstrikes.json"
+          ).write_text(
+              json.dumps(
+                  output,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+
+          print(
+              "SUCCESS:",
+              len(events),
+              "classified events from",
+              events[0]["date"],
+              "through",
+              events[-1]["date"],
+          )
+          PY
+
+      - name: Commit map data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ucdp-airstrikes.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update UCDP airstrike map"
+          git push
