@@ -3,7 +3,7 @@ name: Update Tech for Palestine datasets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "20 12 * * *"
+  - cron: "30 3 * * 1"
 
 permissions:
   contents: write
