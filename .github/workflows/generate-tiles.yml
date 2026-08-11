@@ -3,7 +3,7 @@ name: Generate monthly satellite timeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 3 3 * *"
+  - cron: "30 3 * * 1"
 
 permissions:
   contents: write
