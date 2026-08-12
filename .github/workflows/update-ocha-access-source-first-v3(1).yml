@@ -1,0 +1,445 @@
+name: Rebuild OCHA humanitarian access timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Rebuild timeline directly from OCHA text
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import time
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from urllib.parse import urljoin, quote
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          BASE="https://www.ochaopt.org"
+          OUT=Path("data/ocha-access-denials.json")
+
+          S=requests.Session()
+          S.headers.update({
+              "User-Agent":"GazaTimeline-OCHA-Access/5.0",
+              "Accept-Language":"en-US,en;q=0.9",
+          })
+
+          MONTHS_FULL=(
+              "January|February|March|April|May|June|July|August|"
+              "September|October|November|December"
+          )
+          MONTHS_SHORT="Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+
+          def clean(s):
+              s=(s or "").replace("\xa0"," ").replace("\u2011","-").replace("\u2013","-").replace("\u2014","-")
+              return re.sub(r"\s+"," ",s).strip()
+
+          def fetch(url,timeout=30,retries=3):
+              last=None
+              for attempt in range(1,retries+1):
+                  try:
+                      r=S.get(url,timeout=timeout)
+                      if r.status_code==404:
+                          return None
+                      r.raise_for_status()
+                      return r.text
+                  except Exception as e:
+                      last=e
+                      if attempt<retries:
+                          time.sleep(attempt)
+              print("FETCH WARNING",url,repr(last))
+              return None
+
+          # ---------------------------------------------------------
+          # PUBLICATION DATE: TOP OF PAGE ONLY.
+          # ---------------------------------------------------------
+          def publication_date(soup,visible,title):
+              # Structured metadata if OCHA exposes it.
+              for attrs in (
+                  {"property":"article:published_time"},
+                  {"name":"date"},
+                  {"name":"dcterms.date"},
+              ):
+                  tag=soup.find("meta",attrs=attrs)
+                  if tag and tag.get("content"):
+                      m=re.search(r"(20\d{2}-\d{2}-\d{2})",tag["content"])
+                      if m:return m.group(1)
+
+              for tag in soup.find_all("time"):
+                  raw=clean(tag.get("datetime") or tag.get_text(" ",strip=True))
+                  m=re.search(r"(20\d{2}-\d{2}-\d{2})",raw)
+                  if m:return m.group(1)
+                  m=re.search(rf"\b(\d{{1,2}})\s+({MONTHS_FULL})\s+(20\d{{2}})\b",raw,re.I)
+                  if m:
+                      return datetime.strptime(" ".join(m.groups()),"%d %B %Y").date().isoformat()
+                  m=re.search(rf"\b(\d{{1,2}})\s+({MONTHS_SHORT})\s+(20\d{{2}})\b",raw,re.I)
+                  if m:
+                      return datetime.strptime(" ".join(m.groups()),"%d %b %Y").date().isoformat()
+
+              # Reliable fallback: OCHA renders the publication date immediately
+              # after the title. Inspect only the first 1,200 chars after H1 text.
+              pos=visible.find(title)
+              top=visible[pos:pos+1200] if pos>=0 else visible[:1200]
+
+              m=re.search(rf"\b(\d{{1,2}})\s+({MONTHS_FULL})\s+(20\d{{2}})\b",top,re.I)
+              if m:
+                  return datetime.strptime(" ".join(m.groups()),"%d %B %Y").date().isoformat()
+
+              m=re.search(rf"\b(\d{{1,2}})\s+({MONTHS_SHORT})\s+(20\d{{2}})\b",top,re.I)
+              if m:
+                  return datetime.strptime(" ".join(m.groups()),"%d %b %Y").date().isoformat()
+
+              # Date-titled 2026 reports.
+              m=re.search(rf"\|\s*(\d{{1,2}})\s+({MONTHS_FULL})\s+(20\d{{2}})",title,re.I)
+              if m:
+                  return datetime.strptime(" ".join(m.groups()),"%d %B %Y").date().isoformat()
+
+              return None
+
+          WORDS={
+              "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,
+              "six":6,"seven":7,"eight":8,"nine":9,"ten":10,
+              "eleven":11,"twelve":12,"thirteen":13,"fourteen":14,
+              "fifteen":15,"sixteen":16,"seventeen":17,"eighteen":18,
+              "nineteen":19,"twenty":20,
+          }
+
+          def category_count(text,labels):
+              label="(?:"+"|".join(labels)+")"
+              patterns=[
+                  # 8 (47 per cent) were facilitated
+                  rf"\b(\d{{1,4}})\s*\([^)]*(?:per cent|%)[^)]*\)[^.;:]{{0,70}}?\b{label}\b",
+                  # 47 per cent (8) were facilitated
+                  rf"\b\d{{1,3}}(?:\.\d+)?\s*(?:per cent|%)\s*\((\d{{1,4}})\)[^.;:]{{0,70}}?\b{label}\b",
+                  # 23 were facilitated
+                  rf"\b(\d{{1,4}})\b[^.;:]{{0,55}}?\b{label}\b",
+              ]
+              for p in patterns:
+                  m=re.search(p,text,re.I)
+                  if m:return int(m.group(1))
+
+              for word,n in WORDS.items():
+                  if re.search(rf"\b{word}\b[^.;:]{{0,55}}?\b{label}\b",text,re.I):
+                      return n
+              return None
+
+          # Every occurrence is an actual coordination denominator.
+          ANCHORS=[
+              re.compile(
+                  r"\bout of\s+(?:the\s+)?(?P<n>\d{1,4})\s+"
+                  r"coordinated\s+humanitarian\s+assistance\s+missions?",
+                  re.I,
+              ),
+              re.compile(
+                  r"\bout of\s+(?P<n>\d{1,4})\s+attempts?\s+to\s+coordinate\s+"
+                  r"(?:planned\s+)?aid\s+movements?",
+                  re.I,
+              ),
+              re.compile(
+                  r"\bUN\s+attempted\s+to\s+coordinate\s+with\s+the\s+Israeli\s+authorities\s+"
+                  r"(?P<n>\d{1,4})\s+humanitarian\s+missions?",
+                  re.I,
+              ),
+              re.compile(
+                  r"\b(?P<n>\d{1,4})\s+humanitarian\s+missions?\s+inside\s+Gaza\b",
+                  re.I,
+              ),
+          ]
+
+          def all_anchors(text):
+              found=[]
+              for pat in ANCHORS:
+                  for m in pat.finditer(text):
+                      found.append((m.start(),m.end(),int(m.group("n"))))
+              found.sort()
+              # De-dupe overlapping anchors.
+              result=[]
+              for x in found:
+                  if result and x[0] < result[-1][1]:
+                      continue
+                  result.append(x)
+              return result
+
+          def period_before(text,start):
+              prefix=text[max(0,start-350):start]
+              matches=list(re.finditer(r"\bBetween\s+(.{1,110}?)\s*,\s*$",prefix,re.I))
+              if matches:return clean(matches[-1].group(1))
+              # Slightly broader backward match.
+              matches=list(re.finditer(r"\bBetween\s+(.{1,100}?)\s*,",prefix,re.I))
+              return clean(matches[-1].group(1)) if matches else None
+
+          def region_for(segment):
+              head=segment[:220].lower()
+              if "northern gaza" in head or "north gaza" in head:
+                  return "north"
+              if "southern gaza" in head or "areas in southern gaza" in head:
+                  return "south"
+              if "inside gaza" in head or "gaza strip" in head:
+                  return "gaza"
+              return "unknown"
+
+          def parse_segment(segment,total,pubdate,period):
+              low=segment.lower()
+              if "facilitated" not in low or "denied" not in low:
+                  return None
+
+              fac=category_count(segment,["fully facilitated","facilitated"])
+              den=category_count(segment,["denied access","denied outright","denied"])
+              imp=category_count(segment,["approved but faced impediments","faced impediments","impeded"])
+              can=category_count(segment,["cancelled","canceled","withdrawn"])
+
+              if fac is None or den is None:
+                  return None
+
+              if imp is None:
+                  if "imped" in low:return None
+                  imp=0
+              if can is None:
+                  if "cancel" in low or "withdraw" in low:return None
+                  can=0
+
+              if any(v<0 or v>total for v in (fac,den,imp,can)):
+                  return None
+
+              classified=fac+den+imp+can
+              if classified>total:return None
+
+              other=total-classified
+              if other/total>0.15:return None
+
+              return {
+                  "date":pubdate,
+                  "period":period,
+                  "region":region_for(segment),
+                  "total":total,
+                  "facilitated":fac,
+                  "impeded":imp,
+                  "denied":den,
+                  "cancelled":can,
+                  "other":other,
+              }
+
+          def parse_page(url):
+              raw=fetch(url)
+              if not raw:return []
+
+              soup=BeautifulSoup(raw,"html.parser")
+              h1=soup.find("h1")
+              title=clean(h1.get_text(" ",strip=True)) if h1 else url.rsplit("/",1)[-1]
+              visible=clean(" ".join(soup.stripped_strings))
+              pub=publication_date(soup,visible,title)
+
+              if not pub:
+                  print("NO TOP DATE",url)
+                  return []
+
+              # Situation updates in this scan should never resolve to 2023.
+              if "humanitarian-situation-update-" in url and pub<"2024-01-01":
+                  print("BAD TOP DATE",pub,url)
+                  return []
+
+              anchors=all_anchors(visible)
+              rows=[]
+              last_period=None
+
+              for i,(start,end,total) in enumerate(anchors):
+                  next_start=anchors[i+1][0] if i+1<len(anchors) else len(visible)
+
+                  # Stop at next coordination denominator, but allow enough text
+                  # for outcome sentences (including cancellation sentence).
+                  stop=min(next_start,end+1150)
+                  segment=visible[start:stop]
+
+                  p=period_before(visible,start) or last_period
+                  if p:last_period=p
+
+                  row=parse_segment(segment,total,pub,p)
+                  if row:
+                      row["period"]=row["period"] or f"Reporting period in report published {pub}"
+                      rows.append(row)
+
+              # Aggregate complementary north+south denominators from same page.
+              gaza=[r for r in rows if r["region"]=="gaza"]
+              north=[r for r in rows if r["region"]=="north"]
+              south=[r for r in rows if r["region"]=="south"]
+
+              # OCHA early reports often have exactly one north and one south
+              # denominator in the same reporting paragraph.
+              if north and south:
+                  # Pair rows sharing period; fall back to the only N/S pair.
+                  for n in north:
+                      candidates=[s for s in south if s["period"]==n["period"]]
+                      if not candidates and len(north)==1 and len(south)==1:
+                          candidates=south
+                      for s in candidates[:1]:
+                          gaza.append({
+                              "date":pub,
+                              "period":n["period"] or s["period"],
+                              "region":"gaza",
+                              "total":n["total"]+s["total"],
+                              "facilitated":n["facilitated"]+s["facilitated"],
+                              "impeded":n["impeded"]+s["impeded"],
+                              "denied":n["denied"]+s["denied"],
+                              "cancelled":n["cancelled"]+s["cancelled"],
+                              "other":n["other"]+s["other"],
+                              "derived_from_regions":["north","south"],
+                          })
+
+              unique={}
+              for r in gaza:
+                  key=(r["period"],r["total"],r["facilitated"],r["impeded"],r["denied"],r["cancelled"])
+                  r["label"]=title
+                  r["scope"]="Gaza Strip"
+                  r["url"]=url
+                  unique[key]=r
+
+              return list(unique.values())
+
+          # ---------------------------------------------------------
+          # DISCOVERY FROM OCHA ONLY. NO HISTORICAL JSON INPUT.
+          # ---------------------------------------------------------
+          urls=set()
+
+          queries=[
+              "coordinated humanitarian assistance missions Gaza",
+              "attempted to coordinate Israeli authorities humanitarian missions Gaza",
+              "planned aid movements facilitated denied impeded Gaza",
+              "humanitarian situation update Gaza",
+              "Gaza humanitarian response situation report",
+          ]
+
+          for q in queries:
+              for page in range(0,12):
+                  u=BASE+"/search?search_api_fulltext="+quote(q)+f"&page={page}"
+                  raw=fetch(u,25,2)
+                  if not raw:continue
+                  soup=BeautifulSoup(raw,"html.parser")
+                  found=0
+                  for a in soup.find_all("a",href=True):
+                      href=urljoin(u,a["href"]).split("?")[0].rstrip("/")
+                      low=href.lower()
+                      if BASE in href and "/content/" in href and any(x in low for x in (
+                          "humanitarian-situation-update",
+                          "humanitarian-situation-report",
+                          "gaza-humanitarian-response-situation-report",
+                      )):
+                          urls.add(href);found+=1
+                  if found==0 and page>=3:break
+
+          # Numbered source URLs are discovery candidates only.
+          for n in range(150,365):
+              urls.add(BASE+f"/content/humanitarian-situation-update-{n}-gaza-strip")
+              urls.add(BASE+f"/content/humanitarian-situation-update-{n}-gaza-strip-west-bank")
+
+          for n in range(1,110):
+              urls.add(BASE+f"/content/gaza-humanitarian-response-situation-report-no-{n}")
+
+          d=datetime(2026,1,1).date()
+          today=datetime.now(timezone.utc).date()
+          while d<=today:
+              urls.add(BASE+f"/content/humanitarian-situation-report-{d.day}-{d.strftime('%B').lower()}-{d.year}")
+              d+=timedelta(days=1)
+
+          print("Candidate OCHA URLs:",len(urls))
+
+          extracted=[]
+          for i,url in enumerate(sorted(urls),1):
+              for r in parse_page(url):
+                  total=r["total"]
+                  if sum(r[k] for k in ("facilitated","impeded","denied","cancelled","other"))!=total:
+                      continue
+                  extracted.append(r)
+                  print(
+                      "VALID",
+                      "N+S" if r.get("derived_from_regions") else "DIRECT",
+                      r["date"],r["total"],r["facilitated"],r["impeded"],
+                      r["denied"],r["cancelled"],url
+                  )
+              if i%100==0:
+                  print(f"Scanned {i}/{len(urls)}")
+
+          # De-duplicate repeated identical reporting periods.
+          unique={}
+          for r in extracted:
+              key=(
+                  clean(r["period"]).lower(),
+                  r["total"],r["facilitated"],r["impeded"],
+                  r["denied"],r["cancelled"]
+              )
+              old=unique.get(key)
+              if old is None or (old.get("derived_from_regions") and not r.get("derived_from_regions")):
+                  unique[key]=r
+
+          records=sorted(unique.values(),key=lambda r:(r["date"],r["total"]))
+
+          if len(records)<8:
+              raise RuntimeError(
+                  f"Only {len(records)} independently validated OCHA periods were reconstructed. "
+                  "Refusing to replace the existing dataset."
+              )
+
+          for r in records:
+              if r["date"]<"2024-01-01":
+                  raise RuntimeError(f"Invalid publication date survived: {r}")
+
+          payload={
+              "generated_at":datetime.now(timezone.utc).isoformat(),
+              "source":"United Nations Office for the Coordination of Humanitarian Affairs (OCHA), occupied Palestinian territory",
+              "method":(
+                  "Source-first rebuild from normalized visible OCHA page text. "
+                  "Historical and current pages use the same coordination-anchor parser. "
+                  "Publication dates are taken only from page metadata or the top-of-page date. "
+                  "Complementary north/south Gaza rows are summed when OCHA publishes them separately. "
+                  "No historical seed values, interpolation or carry-forward."
+              ),
+              "records":records,
+          }
+
+          OUT.parent.mkdir(parents=True,exist_ok=True)
+          tmp=OUT.with_suffix(".tmp")
+          tmp.write_text(json.dumps(payload,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          check=json.loads(tmp.read_text(encoding="utf-8"))
+          if len(check["records"])!=len(records):
+              raise RuntimeError("Final JSON validation failed")
+          tmp.replace(OUT)
+
+          print()
+          print("VALID SOURCE-FIRST OCHA ACCESS TIMELINE")
+          print("Comparable periods:",len(records))
+          print("First:",records[0]["date"])
+          print("Last:",records[-1]["date"])
+          PY
+
+      - name: Commit OCHA access data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/ocha-access-denials.json
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Rebuild OCHA humanitarian access timeline"
+          git pull --rebase origin main
+          git push origin main
