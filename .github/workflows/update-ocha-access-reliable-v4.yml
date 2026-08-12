@@ -1,0 +1,1130 @@
+name: Rebuild OCHA humanitarian access timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Rebuild OCHA access timeline
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          BASE = "https://www.ochaopt.org"
+          OUT = Path("data/ocha-access-denials.json")
+
+          INDEXES = [
+              BASE + "/publications/humanitarian-situation-update",
+              BASE + "/publications/situation-reports",
+          ]
+
+          S = requests.Session()
+          S.headers.update({
+              "User-Agent": "GazaTimeline-OCHA-Access/6.0",
+              "Accept-Language": "en-US,en;q=0.9",
+          })
+
+          MONTHS = {
+              "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+              "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+              "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+              "January": 1, "February": 2, "March": 3,
+              "April": 4, "June": 6, "July": 7, "August": 8,
+              "September": 9, "October": 10, "November": 11,
+              "December": 12,
+          }
+
+          WORDS = {
+              "zero": 0, "one": 1, "two": 2, "three": 3,
+              "four": 4, "five": 5, "six": 6, "seven": 7,
+              "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+              "twelve": 12, "thirteen": 13, "fourteen": 14,
+              "fifteen": 15, "sixteen": 16, "seventeen": 17,
+              "eighteen": 18, "nineteen": 19, "twenty": 20,
+          }
+
+          NUM = (
+              r"(?:\d{1,4}|zero|one|two|three|four|five|six|"
+              r"seven|eight|nine|ten|eleven|twelve|thirteen|"
+              r"fourteen|fifteen|sixteen|seventeen|eighteen|"
+              r"nineteen|twenty)"
+          )
+
+          def clean(text):
+              return re.sub(
+                  r"\s+",
+                  " ",
+                  (text or "")
+                  .replace("\xa0", " ")
+                  .replace("\u2011", "-")
+                  .replace("\u2012", "-")
+                  .replace("\u2013", "-")
+                  .replace("\u2014", "-"),
+              ).strip()
+
+          def to_int(value):
+              value = value.lower()
+              if value.isdigit():
+                  return int(value)
+              return WORDS.get(value)
+
+          def fetch(url, timeout=35, retries=4):
+              last = None
+
+              for attempt in range(1, retries + 1):
+                  try:
+                      response = S.get(url, timeout=timeout)
+
+                      if response.status_code == 404:
+                          return None
+
+                      response.raise_for_status()
+                      return response.text
+
+                  except Exception as error:
+                      last = error
+
+                      if attempt < retries:
+                          time.sleep(1.5 * attempt)
+
+              print("FETCH WARNING:", url, repr(last))
+              return None
+
+          # ============================================================
+          # DISCOVERY
+          #
+          # Publication date and article URL come from OCHA's own
+          # publication indexes, NOT from article-body text and NOT from
+          # guessed historical URLs.
+          # ============================================================
+
+          def parse_index_date(text):
+              text = clean(text)
+
+              # OCHA listing format: 17 Jul 2026
+              match = re.search(
+                  r"\b(\d{1,2})\s+"
+                  r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                  r"\s+(20\d{2})\b",
+                  text,
+                  re.I,
+              )
+
+              if not match:
+                  return None
+
+              day = int(match.group(1))
+              month_name = match.group(2).title()
+              year = int(match.group(3))
+
+              return datetime(
+                  year,
+                  MONTHS[month_name],
+                  day,
+              ).date().isoformat()
+
+          def discover_reports():
+              found = {}
+
+              for base_index in INDEXES:
+                  empty_pages = 0
+
+                  # More than enough for the full post-Oct-2023 archive,
+                  # but stop automatically after consecutive empty pages.
+                  for page in range(0, 45):
+                      url = (
+                          base_index
+                          + "?field_publication_topic_target_id=All"
+                          + "&field_publication_type_target_id_1=All"
+                          + "&field_publish_date_value=All"
+                          + "&location=All"
+                          + f"&page={page}"
+                      )
+
+                      raw = fetch(
+                          url,
+                          timeout=30,
+                          retries=3,
+                      )
+
+                      if not raw:
+                          empty_pages += 1
+                          if empty_pages >= 2:
+                              break
+                          continue
+
+                      soup = BeautifulSoup(
+                          raw,
+                          "html.parser",
+                      )
+
+                      page_found = 0
+
+                      # Publication cards contain an article link and nearby
+                      # listing date. We don't assume a specific Drupal class.
+                      for anchor in soup.find_all("a", href=True):
+                          href = urljoin(
+                              url,
+                              anchor["href"],
+                          ).split("?")[0].rstrip("/")
+
+                          low = href.lower()
+
+                          if (
+                              BASE not in href
+                              or "/content/" not in href
+                          ):
+                              continue
+
+                          if not any(
+                              token in low
+                              for token in (
+                                  "humanitarian-situation-update",
+                                  "humanitarian-situation-report",
+                                  "gaza-humanitarian-response-situation-report",
+                                  "humanitarian-access-snapshot",
+                              )
+                          ):
+                              continue
+
+                          title = clean(
+                              anchor.get_text(
+                                  " ",
+                                  strip=True,
+                              )
+                          )
+
+                          if not title:
+                              continue
+
+                          # Walk up a few ancestors to find the card's
+                          # publication date.
+                          date = None
+                          node = anchor
+
+                          for _ in range(7):
+                              node = node.parent
+
+                              if not node:
+                                  break
+
+                              candidate_text = clean(
+                                  node.get_text(
+                                      " ",
+                                      strip=True,
+                                  )
+                              )
+
+                              date = parse_index_date(
+                                  candidate_text
+                              )
+
+                              if date:
+                                  break
+
+                          if not date:
+                              # Index item without a resolvable listing date is
+                              # skipped rather than guessing from the article.
+                              continue
+
+                          # Gaza only.
+                          title_low = title.lower()
+
+                          if (
+                              "west bank" in title_low
+                              and "gaza strip" not in title_low
+                          ):
+                              continue
+
+                          # Dataset starts after 7 Oct 2023.
+                          if date < "2023-10-07":
+                              continue
+
+                          old = found.get(href)
+
+                          if (
+                              old is None
+                              or date > old["publication_date"]
+                          ):
+                              found[href] = {
+                                  "url": href,
+                                  "title": title,
+                                  "publication_date": date,
+                              }
+
+                          page_found += 1
+
+                      print(
+                          "INDEX",
+                          base_index.rsplit("/", 1)[-1],
+                          "page",
+                          page,
+                          "links",
+                          page_found,
+                      )
+
+                      if page_found == 0:
+                          empty_pages += 1
+                      else:
+                          empty_pages = 0
+
+                      if empty_pages >= 2:
+                          break
+
+              reports = sorted(
+                  found.values(),
+                  key=lambda r: (
+                      r["publication_date"],
+                      r["url"],
+                  ),
+              )
+
+              print(
+                  "OCHA REPORTS DISCOVERED:",
+                  len(reports),
+              )
+
+              return reports
+
+          # ============================================================
+          # ARTICLE TEXT PARSER
+          #
+          # It does not care whether OCHA uses p/li/div tags.
+          # It finds actual coordination denominators in normalized
+          # visible text and extracts category counts around them.
+          # ============================================================
+
+          TOTAL_PATTERNS = [
+              # out of 461 planned aid movements
+              re.compile(
+                  rf"\bout of\s+(?:the\s+)?(?P<n>{NUM})\s+"
+                  rf"(?:planned\s+)?(?:coordinated\s+)?"
+                  rf"(?:humanitarian\s+assistance\s+|aid\s+|humanitarian\s+)?"
+                  rf"(?:missions?|movements?)",
+                  re.I,
+              ),
+
+              # out of 81 attempts to coordinate planned aid movements
+              re.compile(
+                  rf"\bout of\s+(?P<n>{NUM})\s+attempts?\s+to\s+"
+                  rf"coordinate\s+(?:planned\s+)?(?:aid\s+)?movements?",
+                  re.I,
+              ),
+
+              # the UN attempted to coordinate ... 58 humanitarian missions
+              re.compile(
+                  rf"\b(?:the\s+)?(?:UN|United Nations)\s+attempted\s+to\s+"
+                  rf"coordinate(?:\s+with\s+the\s+Israeli\s+authorities)?\s+"
+                  rf"(?P<n>{NUM})\s+humanitarian\s+(?:missions?|movements?)",
+                  re.I,
+              ),
+
+              # the United Nations coordinated 67 humanitarian missions
+              re.compile(
+                  rf"\b(?:the\s+)?(?:UN|United Nations)\s+coordinated\s+"
+                  rf"(?P<n>{NUM})\s+humanitarian\s+(?:missions?|movements?)",
+                  re.I,
+              ),
+          ]
+
+          def find_totals(text):
+              results = []
+
+              for pattern in TOTAL_PATTERNS:
+                  for match in pattern.finditer(text):
+                      value = to_int(
+                          match.group("n")
+                      )
+
+                      if value is None:
+                          continue
+
+                      results.append({
+                          "start": match.start(),
+                          "end": match.end(),
+                          "total": value,
+                          "matched": match.group(0),
+                      })
+
+              results.sort(
+                  key=lambda x: (
+                      x["start"],
+                      -(x["end"] - x["start"]),
+                  )
+              )
+
+              # De-duplicate overlapping interpretations of the same
+              # denominator, keeping the longest match.
+              deduped = []
+
+              for candidate in results:
+                  if (
+                      deduped
+                      and candidate["start"] == deduped[-1]["start"]
+                  ):
+                      continue
+
+                  if (
+                      deduped
+                      and candidate["start"] < deduped[-1]["end"]
+                  ):
+                      continue
+
+                  deduped.append(candidate)
+
+              return deduped
+
+          def category_count(text, labels):
+              label = "(?:" + "|".join(labels) + ")"
+
+              # Find each actual category word first, then inspect only a short
+              # amount of text immediately before it. This prevents a number
+              # belonging to "facilitated" from being stolen by "denied".
+              for label_match in re.finditer(
+                  rf"\b{label}\b",
+                  text,
+                  re.I,
+              ):
+                  prefix = text[
+                      max(
+                          0,
+                          label_match.start() - 125,
+                      ):
+                      label_match.start()
+                  ]
+
+                  # Do not cross strong sentence boundaries.
+                  cut = max(
+                      prefix.rfind("."),
+                      prefix.rfind(";"),
+                      prefix.rfind(":"),
+                  )
+
+                  if cut >= 0:
+                      prefix = prefix[
+                          cut + 1:
+                      ]
+
+                  # 34 per cent (159) were facilitated
+                  matches = list(
+                      re.finditer(
+                          rf"\d{{1,3}}(?:\.\d+)?\s*"
+                          rf"(?:per cent|%)\s*"
+                          rf"\((?P<n>{NUM})\)"
+                          rf"[^,;.()]{{0,50}}$",
+                          prefix,
+                          re.I,
+                      )
+                  )
+
+                  if matches:
+                      return to_int(
+                          matches[-1].group("n")
+                      )
+
+                  # 23 (40 per cent) were facilitated
+                  matches = list(
+                      re.finditer(
+                          rf"\b(?P<n>{NUM})\s*"
+                          rf"(?:other\s+)?"
+                          rf"(?:missions?|movements?|attempts?)?\s*"
+                          rf"\([^()]*(?:per cent|%)[^()]*\)"
+                          rf"[^,;.()]{{0,60}}$",
+                          prefix,
+                          re.I,
+                      )
+                  )
+
+                  if matches:
+                      return to_int(
+                          matches[-1].group("n")
+                      )
+
+                  # 20 were denied / five were initially approved...
+                  # Restrict to the current comma-delimited clause.
+                  clause = prefix.split(",")[-1]
+
+                  numbers = list(
+                      re.finditer(
+                          rf"\b(?P<n>{NUM})\b",
+                          clause,
+                          re.I,
+                      )
+                  )
+
+                  if numbers:
+                      return to_int(
+                          numbers[-1].group("n")
+                      )
+
+              return None
+
+          def region_around(text, start, end):
+              context = clean(
+                  text[
+                      max(0, start - 80):
+                      min(len(text), end + 220)
+                  ]
+              ).lower()
+
+              if any(
+                  phrase in context
+                  for phrase in (
+                      "to northern gaza",
+                      "in northern gaza",
+                      "to areas in northern gaza",
+                      "north gaza",
+                      "north of wadi gaza",
+                  )
+              ):
+                  return "north"
+
+              if any(
+                  phrase in context
+                  for phrase in (
+                      "to areas in southern gaza",
+                      "in southern gaza",
+                      "southern gaza",
+                      "south of wadi gaza",
+                  )
+              ):
+                  return "south"
+
+              if any(
+                  phrase in context
+                  for phrase in (
+                      "across the gaza strip",
+                      "inside gaza",
+                      "across gaza",
+                      "within gaza",
+                  )
+              ):
+                  return "gaza"
+
+              return "unknown"
+
+          def period_before(text, start):
+              prefix = text[
+                  max(0, start - 420):
+                  start
+              ]
+
+              matches = list(
+                  re.finditer(
+                      r"\bBetween\s+(.{1,120}?)\s*,",
+                      prefix,
+                      re.I,
+                  )
+              )
+
+              if matches:
+                  return clean(
+                      matches[-1].group(1)
+                  )
+
+              # Monthly older snapshot language: "In May, out of..."
+              matches = list(
+                  re.finditer(
+                      r"\bIn\s+"
+                      r"(January|February|March|April|May|June|July|"
+                      r"August|September|October|November|December)"
+                      r"(?:\s+(20\d{2}))?\s*,\s*$",
+                      prefix,
+                      re.I,
+                  )
+              )
+
+              if matches:
+                  month = matches[-1].group(1)
+                  year = matches[-1].group(2)
+
+                  return (
+                      month + (" " + year if year else "")
+                  )
+
+              return None
+
+          def parse_article(report):
+              raw = fetch(
+                  report["url"],
+                  timeout=35,
+                  retries=4,
+              )
+
+              if not raw:
+                  return []
+
+              soup = BeautifulSoup(
+                  raw,
+                  "html.parser",
+              )
+
+              # Remove navigation/script/style noise before normalizing text.
+              for tag in soup(
+                  [
+                      "script",
+                      "style",
+                      "nav",
+                      "header",
+                      "footer",
+                      "noscript",
+                  ]
+              ):
+                  tag.decompose()
+
+              text = clean(
+                  " ".join(
+                      soup.stripped_strings
+                  )
+              )
+
+              totals = find_totals(
+                  text
+              )
+
+              rows = []
+              inherited_period = None
+
+              for index, item in enumerate(
+                  totals
+              ):
+                  # A category set belongs to this denominator until the next
+                  # denominator. Cap the window to avoid unrelated later text.
+                  next_start = (
+                      totals[index + 1]["start"]
+                      if index + 1 < len(totals)
+                      else len(text)
+                  )
+
+                  segment = text[
+                      item["end"]:
+                      min(
+                          next_start,
+                          item["end"] + 1450,
+                      )
+                  ]
+
+                  period = period_before(
+                      text,
+                      item["start"],
+                  )
+
+                  if period:
+                      inherited_period = period
+                  else:
+                      period = inherited_period
+
+                  region = region_around(
+                      text,
+                      item["start"],
+                      item["end"],
+                  )
+
+                  facilitated = category_count(
+                      segment,
+                      [
+                          "fully facilitated",
+                          "facilitated",
+                      ],
+                  )
+
+                  denied = category_count(
+                      segment,
+                      [
+                          "denied access",
+                          "denied outright",
+                          "outright denied",
+                          "denied",
+                      ],
+                  )
+
+                  impeded = category_count(
+                      segment,
+                      [
+                          "interfered with or initially agreed to but then faced impediments",
+                          "approved but faced impediments",
+                          "initially approved but then impeded",
+                          "faced impediments",
+                          "impeded",
+                      ],
+                  )
+
+                  cancelled = category_count(
+                      segment,
+                      [
+                          "had to be withdrawn",
+                          "withdrawn",
+                          "cancelled",
+                          "canceled",
+                      ],
+                  )
+
+                  # Core categories required.
+                  if (
+                      facilitated is None
+                      or denied is None
+                  ):
+                      continue
+
+                  segment_low = segment.lower()
+
+                  if impeded is None:
+                      if "imped" in segment_low:
+                          # Category is mentioned but parser cannot safely
+                          # associate a number: reject this denominator.
+                          continue
+
+                      impeded = 0
+
+                  if cancelled is None:
+                      if (
+                          "cancel" in segment_low
+                          or "withdraw" in segment_low
+                      ):
+                          continue
+
+                      cancelled = 0
+
+                  total = item["total"]
+
+                  if any(
+                      value < 0
+                      or value > total
+                      for value in (
+                          facilitated,
+                          denied,
+                          impeded,
+                          cancelled,
+                      )
+                  ):
+                      continue
+
+                  classified = (
+                      facilitated
+                      + denied
+                      + impeded
+                      + cancelled
+                  )
+
+                  if classified > total:
+                      continue
+
+                  other = (
+                      total
+                      - classified
+                  )
+
+                  # OCHA occasionally leaves one or a few movements outside
+                  # the four named categories. Keep that remainder explicitly,
+                  # but reject obviously incomplete parses.
+                  if other / total > 0.20:
+                      continue
+
+                  rows.append({
+                      "publication_date": report[
+                          "publication_date"
+                      ],
+                      "date": report[
+                          "publication_date"
+                      ],
+                      "label": report[
+                          "title"
+                      ],
+                      "period": (
+                          period
+                          or "Reporting period in "
+                             + report["title"]
+                      ),
+                      "region": region,
+                      "total": total,
+                      "facilitated": facilitated,
+                      "impeded": impeded,
+                      "denied": denied,
+                      "cancelled": cancelled,
+                      "other": other,
+                      "url": report[
+                          "url"
+                      ],
+                  })
+
+              # ======================================================
+              # CHOOSE GAZA-WIDE VALUE
+              #
+              # Prefer an explicit Gaza-wide denominator.
+              # Otherwise aggregate one north + one south denominator
+              # from the same reporting period.
+              # ======================================================
+
+              direct = [
+                  row
+                  for row in rows
+                  if row["region"] == "gaza"
+              ]
+
+              if direct:
+                  # There can be nested Gaza-wide subgroups in long reports.
+                  # The main all-Gaza denominator is normally the largest.
+                  best = max(
+                      direct,
+                      key=lambda row: row["total"],
+                  )
+
+                  best["method"] = (
+                      "direct Gaza-wide OCHA breakdown"
+                  )
+
+                  return [best]
+
+              north = [
+                  row
+                  for row in rows
+                  if row["region"] == "north"
+              ]
+
+              south = [
+                  row
+                  for row in rows
+                  if row["region"] == "south"
+              ]
+
+              if north and south:
+                  # Find the pair most plausibly representing complementary
+                  # regional totals. Prefer matching period strings, otherwise
+                  # the largest north/south pair on that report.
+                  pairs = []
+
+                  for n in north:
+                      for s in south:
+                          score = 0
+
+                          if (
+                              clean(n["period"]).lower()
+                              == clean(s["period"]).lower()
+                          ):
+                              score += 1000000
+
+                          score += (
+                              n["total"]
+                              + s["total"]
+                          )
+
+                          pairs.append(
+                              (
+                                  score,
+                                  n,
+                                  s,
+                              )
+                          )
+
+                  _, n, s = max(
+                      pairs,
+                      key=lambda item: item[0],
+                  )
+
+                  aggregate = {
+                      "publication_date": report[
+                          "publication_date"
+                      ],
+                      "date": report[
+                          "publication_date"
+                      ],
+                      "label": report[
+                          "title"
+                      ],
+                      "period": (
+                          n["period"]
+                          if clean(
+                              n["period"]
+                          ).lower()
+                          == clean(
+                              s["period"]
+                          ).lower()
+                          else "Reporting period in "
+                               + report["title"]
+                      ),
+                      "region": "gaza",
+                      "scope": "Gaza Strip",
+                      "total": (
+                          n["total"]
+                          + s["total"]
+                      ),
+                      "facilitated": (
+                          n["facilitated"]
+                          + s["facilitated"]
+                      ),
+                      "impeded": (
+                          n["impeded"]
+                          + s["impeded"]
+                      ),
+                      "denied": (
+                          n["denied"]
+                          + s["denied"]
+                      ),
+                      "cancelled": (
+                          n["cancelled"]
+                          + s["cancelled"]
+                      ),
+                      "other": (
+                          n["other"]
+                          + s["other"]
+                      ),
+                      "url": report[
+                          "url"
+                      ],
+                      "method": (
+                          "north + south OCHA breakdowns summed"
+                      ),
+                  }
+
+                  if (
+                      aggregate["facilitated"]
+                      + aggregate["impeded"]
+                      + aggregate["denied"]
+                      + aggregate["cancelled"]
+                      + aggregate["other"]
+                      != aggregate["total"]
+                  ):
+                      return []
+
+                  return [aggregate]
+
+              return []
+
+          # ============================================================
+          # BUILD ENTIRE TIMELINE FROM SOURCE
+          # ============================================================
+
+          reports = discover_reports()
+
+          extracted = []
+
+          for index, report in enumerate(
+              reports,
+              start=1,
+          ):
+              rows = parse_article(
+                  report
+              )
+
+              for row in rows:
+                  extracted.append(
+                      row
+                  )
+
+                  print(
+                      "VALID",
+                      row["date"],
+                      row["total"],
+                      row["facilitated"],
+                      row["impeded"],
+                      row["denied"],
+                      row["cancelled"],
+                      row["method"],
+                      row["url"],
+                  )
+
+              if index % 50 == 0:
+                  print(
+                      "SCANNED",
+                      index,
+                      "/",
+                      len(reports),
+                      "OCHA reports",
+                  )
+
+          # ============================================================
+          # DEDUPLICATE
+          # ============================================================
+
+          unique = {}
+
+          for row in extracted:
+              # Same coordination period may be quoted again later.
+              signature = (
+                  clean(
+                      row["period"]
+                  ).lower(),
+                  row["total"],
+                  row["facilitated"],
+                  row["impeded"],
+                  row["denied"],
+                  row["cancelled"],
+              )
+
+              existing = unique.get(
+                  signature
+              )
+
+              if existing is None:
+                  unique[signature] = row
+                  continue
+
+              # Prefer direct OCHA Gaza-wide breakdown over our transparent
+              # north+south arithmetic if both describe the same period.
+              if (
+                  existing["method"]
+                  != "direct Gaza-wide OCHA breakdown"
+                  and row["method"]
+                  == "direct Gaza-wide OCHA breakdown"
+              ):
+                  unique[signature] = row
+
+          records = sorted(
+              unique.values(),
+              key=lambda row: (
+                  row["date"],
+                  row["period"],
+              ),
+          )
+
+          # ============================================================
+          # FINAL SAFETY VALIDATION
+          # ============================================================
+
+          if len(records) < 10:
+              raise RuntimeError(
+                  f"Only {len(records)} independently validated "
+                  "OCHA access periods were reconstructed. "
+                  "Refusing to replace the existing dataset."
+              )
+
+          for row in records:
+              if (
+                  row["facilitated"]
+                  + row["impeded"]
+                  + row["denied"]
+                  + row["cancelled"]
+                  + row["other"]
+                  != row["total"]
+              ):
+                  raise RuntimeError(
+                      "Arithmetic validation failed: "
+                      + repr(row)
+                  )
+
+              if row["date"] < "2024-01-01":
+                  raise RuntimeError(
+                      "Unexpected pre-2024 row: "
+                      + repr(row)
+                  )
+
+          payload = {
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "source": (
+                  "United Nations Office for the Coordination "
+                  "of Humanitarian Affairs (OCHA), occupied "
+                  "Palestinian territory"
+              ),
+              "method": (
+                  "Entire series rebuilt from OCHA on every run. "
+                  "Article URLs, titles and publication dates are discovered "
+                  "from OCHA publication indexes. Mission outcomes are parsed "
+                  "from normalized article text using the same parser for "
+                  "historical and new reports. Explicit Gaza-wide breakdowns "
+                  "are preferred; complementary northern and southern Gaza "
+                  "breakdowns are summed when required. No historical seed "
+                  "statistics, interpolation or carry-forward are used."
+              ),
+              "records": records,
+          }
+
+          OUT.parent.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          temp = OUT.with_suffix(
+              ".tmp"
+          )
+
+          temp.write_text(
+              json.dumps(
+                  payload,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+
+          # Parse exact output bytes again before publication.
+          check = json.loads(
+              temp.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          if (
+              len(
+                  check.get(
+                      "records",
+                      [],
+                  )
+              )
+              != len(records)
+          ):
+              raise RuntimeError(
+                  "Final JSON validation failed"
+              )
+
+          temp.replace(
+              OUT
+          )
+
+          print()
+          print(
+              "SUCCESS — OCHA HUMANITARIAN ACCESS TIMELINE"
+          )
+          print(
+              "Comparable periods:",
+              len(records),
+          )
+          print(
+              "First:",
+              records[0]["date"],
+          )
+          print(
+              "Last:",
+              records[-1]["date"],
+          )
+          PY
+
+      - name: Commit OCHA access data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/ocha-access-denials.json
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Rebuild OCHA humanitarian access timeline"
+          git pull --rebase origin main
+          git push origin main
