@@ -1,0 +1,682 @@
+name: Rebuild OCHA humanitarian access timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Rebuild timeline directly from OCHA
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import time
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          BASE = "https://www.ochaopt.org"
+          OUT = Path("data/ocha-access-denials.json")
+
+          S = requests.Session()
+          S.headers.update({
+              "User-Agent": "GazaTimeline-OCHA-Access/3.0",
+              "Accept-Language": "en-US,en;q=0.9",
+          })
+
+          MONTHS = (
+              "January|February|March|April|May|June|July|August|"
+              "September|October|November|December"
+          )
+
+          def fetch(url, timeout=30, retries=3):
+              last = None
+              for attempt in range(1, retries + 1):
+                  try:
+                      r = S.get(url, timeout=timeout)
+
+                      # Missing speculative URLs are normal.
+                      if r.status_code == 404:
+                          return None
+
+                      r.raise_for_status()
+                      return r.text
+
+                  except Exception as e:
+                      last = e
+
+                      if attempt < retries:
+                          time.sleep(1.0 * attempt)
+
+              print("FETCH WARNING:", url, repr(last))
+              return None
+
+          def publication_date(soup, text):
+              meta = soup.find(
+                  "meta",
+                  attrs={"property": "article:published_time"},
+              )
+              if meta and meta.get("content"):
+                  value = meta["content"][:10]
+                  if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", value):
+                      return value
+
+              # OCHA pages often place a date immediately after the title.
+              m = re.search(
+                  rf"\b(\d{{1,2}})\s+({MONTHS})\s+(20\d{{2}})\b",
+                  text,
+                  re.I,
+              )
+              if m:
+                  return datetime.strptime(
+                      " ".join(m.groups()),
+                      "%d %B %Y",
+                  ).date().isoformat()
+
+              return None
+
+          def clean_text(s):
+              s = s.replace("\xa0", " ")
+              s = re.sub(r"\s+", " ", s)
+              return s.strip()
+
+          def find_total(text):
+              patterns = [
+                  # "out of 580 planned aid movements..."
+                  r"\bout of\s+(\d{1,4})\s+(?:planned\s+)?(?:aid|humanitarian)\s+(?:movements?|missions?)",
+
+                  # "the UN attempted to coordinate 48 humanitarian missions..."
+                  r"\b(?:the\s+)?UN\s+attempted\s+to\s+coordinate\s+(\d{1,4})\s+humanitarian\s+(?:missions?|movements?)",
+
+                  # "598 coordinated humanitarian movements"
+                  r"\b(\d{1,4})\s+coordinated\s+humanitarian\s+(?:movements?|missions?)",
+
+                  # "24 humanitarian movements inside Gaza that required coordination..."
+                  r"\b(\d{1,4})\s+humanitarian\s+(?:movements?|missions?)\s+inside\s+Gaza\s+that\s+required\s+coordination",
+
+                  # "58 attempts to coordinate planned aid movements..."
+                  r"\bout of\s+(\d{1,4})\s+attempts?\s+to\s+coordinate\s+(?:planned\s+)?aid\s+movements?",
+
+                  # Generic fallback constrained to humanitarian/aid language.
+                  r"\b(?:a total of\s+)?(\d{1,4})\s+(?:planned\s+)?(?:aid|humanitarian)\s+(?:movements?|missions?)\b",
+              ]
+
+              for pat in patterns:
+                  m = re.search(pat, text, re.I)
+                  if m:
+                      return int(m.group(1))
+
+              return None
+
+          def category_count(text, labels):
+              label = "(?:" + "|".join(labels) + ")"
+
+              patterns = [
+                  # "44 per cent (254) were denied"
+                  rf"\b\d{{1,3}}(?:\.\d+)?\s*(?:per cent|%)\s*\((\d{{1,4}})\)"
+                  rf"[^.;:]{{0,80}}?\b{label}\b",
+
+                  # "25 missions (52 per cent) were facilitated"
+                  rf"\b(\d{{1,4}})\s+(?:missions?|movements?|attempts?)?\s*"
+                  rf"\([^)]*(?:per cent|%)[^)]*\)[^.;:]{{0,70}}?\b{label}\b",
+
+                  # "five were denied outright"
+                  # numeric version
+                  rf"\b(\d{{1,4}})\s+(?:missions?|movements?|attempts?)?\s*"
+                  rf"[^.;:]{{0,55}}?\b{label}\b",
+              ]
+
+              for pat in patterns:
+                  m = re.search(pat, text, re.I)
+                  if m:
+                      return int(m.group(1))
+
+              # OCHA sometimes spells out small integers.
+              words = {
+                  "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+                  "five": 5, "six": 6, "seven": 7, "eight": 8,
+                  "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+                  "thirteen": 13, "fourteen": 14, "fifteen": 15,
+                  "sixteen": 16, "seventeen": 17, "eighteen": 18,
+                  "nineteen": 19, "twenty": 20,
+              }
+
+              for word, number in words.items():
+                  if re.search(
+                      rf"\b{word}\b[^.;:]{{0,55}}?\b{label}\b",
+                      text,
+                      re.I,
+                  ):
+                      return number
+
+              return None
+
+          def period_from_text(text, pubdate):
+              patterns = [
+                  r"\bBetween\s+(.{1,100}?)\s*,\s*(?:out of|the UN|UN attempted)",
+                  r"\bIn\s+(January|February|March|April|May|June|July|August|September|October|November|December)"
+                  r"(?:\s+(20\d{2}))?\s*,",
+              ]
+
+              m = re.search(patterns[0], text, re.I)
+              if m:
+                  return clean_text(m.group(1))
+
+              m = re.search(patterns[1], text, re.I)
+              if m:
+                  return clean_text(
+                      m.group(1) + (" " + m.group(2) if m.group(2) else "")
+                  )
+
+              return f"Reporting period in report published {pubdate}"
+
+          def blocks_for_page(soup):
+              blocks = []
+
+              raw = []
+              for tag in soup.find_all(["p", "li"]):
+                  text = clean_text(" ".join(tag.stripped_strings))
+                  if 60 <= len(text) <= 4000:
+                      raw.append(text)
+                      blocks.append(text)
+
+              # Some OCHA reports split total/outcomes/cancellations over
+              # adjacent paragraphs. Add 2- and 3-paragraph windows.
+              for size in (2, 3):
+                  for i in range(0, len(raw) - size + 1):
+                      joined = clean_text(" ".join(raw[i:i + size]))
+                      if len(joined) <= 6500:
+                          blocks.append(joined)
+
+              return blocks
+
+          def parse_page(url):
+              html = fetch(url)
+              if not html:
+                  return []
+
+              soup = BeautifulSoup(html, "html.parser")
+
+              h1 = soup.find("h1")
+              title = (
+                  clean_text(h1.get_text(" ", strip=True))
+                  if h1
+                  else url.rsplit("/", 1)[-1]
+              )
+
+              whole = clean_text(" ".join(soup.stripped_strings))
+              pubdate = publication_date(soup, whole)
+
+              if not pubdate:
+                  return []
+
+              candidates = []
+
+              for text in blocks_for_page(soup):
+                  low = text.lower()
+
+                  if "israeli authorit" not in low:
+                      continue
+
+                  if "humanitarian" not in low and "aid movement" not in low:
+                      continue
+
+                  if "denied" not in low or "facilitated" not in low:
+                      continue
+
+                  total = find_total(text)
+                  if not total or total < 2:
+                      continue
+
+                  facilitated = category_count(
+                      text,
+                      ["facilitated", "fully facilitated"],
+                  )
+
+                  denied = category_count(
+                      text,
+                      ["denied", "denied outright", "outright denied"],
+                  )
+
+                  impeded = category_count(
+                      text,
+                      [
+                          "impeded",
+                          "faced impediments",
+                          "approved but faced impediments",
+                      ],
+                  )
+
+                  cancelled = category_count(
+                      text,
+                      [
+                          "cancelled",
+                          "canceled",
+                          "withdrawn",
+                          "had to be cancelled",
+                      ],
+                  )
+
+                  # We require the two key comparable categories.
+                  if facilitated is None or denied is None:
+                      continue
+
+                  # Missing impeded/cancelled language can legitimately mean zero,
+                  # but only set zero if the category word is absent from the block.
+                  if impeded is None:
+                      if "imped" in low:
+                          continue
+                      impeded = 0
+
+                  if cancelled is None:
+                      if (
+                          "cancel" in low
+                          or "withdraw" in low
+                      ):
+                          continue
+                      cancelled = 0
+
+                  values = {
+                      "facilitated": facilitated,
+                      "impeded": impeded,
+                      "denied": denied,
+                      "cancelled": cancelled,
+                  }
+
+                  if any(
+                      v < 0 or v > total
+                      for v in values.values()
+                  ):
+                      continue
+
+                  classified = sum(values.values())
+
+                  if classified > total:
+                      continue
+
+                  other = total - classified
+
+                  # Keep a small explicit remainder, but reject paragraphs where
+                  # too much of the stated total is unexplained.
+                  if other / total > 0.20:
+                      continue
+
+                  # Avoid accidentally selecting a nested North-Gaza subset when
+                  # the same block also contains the all-Gaza total.
+                  scope = "Gaza Strip"
+                  if re.search(
+                      r"\b(?:North Gaza governorate|northern Gaza only|to northern Gaza)\b",
+                      text,
+                      re.I,
+                  ) and not re.search(
+                      r"\bacross the Gaza Strip\b",
+                      text,
+                      re.I,
+                  ):
+                      scope = "Sub-area"
+
+                  candidates.append({
+                      "date": pubdate,
+                      "label": title,
+                      "period": period_from_text(text, pubdate),
+                      "scope": scope,
+                      "total": total,
+                      "facilitated": facilitated,
+                      "impeded": impeded,
+                      "denied": denied,
+                      "cancelled": cancelled,
+                      "other": other,
+                      "url": url,
+                  })
+
+              # Prefer Gaza-wide records, then the largest stated total.
+              candidates.sort(
+                  key=lambda r: (
+                      r["scope"] == "Gaza Strip",
+                      r["total"],
+                  ),
+                  reverse=True,
+              )
+
+              # De-duplicate identical extracted periods within the page.
+              unique = []
+              seen = set()
+
+              for r in candidates:
+                  key = (
+                      r["total"],
+                      r["facilitated"],
+                      r["impeded"],
+                      r["denied"],
+                      r["cancelled"],
+                  )
+                  if key not in seen:
+                      seen.add(key)
+                      unique.append(r)
+
+              return unique
+
+          # ---------------------------------------------------------
+          # DISCOVERY — entirely from OCHA / OCHA URL patterns.
+          # No historical JSON or pre-entered historical values used.
+          # ---------------------------------------------------------
+
+          urls = set()
+
+          search_queries = [
+              "humanitarian situation update Gaza facilitated denied impeded",
+              "humanitarian access Gaza coordinated movements",
+              "Gaza humanitarian response situation report denied facilitated",
+              "planned aid movements coordination Israeli authorities Gaza",
+          ]
+
+          # OCHA's own search results. Walk several pages for historical coverage.
+          for query in search_queries:
+              q = query.replace(" ", "%20")
+
+              for page_num in range(0, 12):
+                  search_url = (
+                      BASE
+                      + "/search?search_api_fulltext="
+                      + q
+                      + f"&page={page_num}"
+                  )
+
+                  html = fetch(
+                      search_url,
+                      timeout=25,
+                      retries=2,
+                  )
+
+                  if not html:
+                      continue
+
+                  soup = BeautifulSoup(
+                      html,
+                      "html.parser",
+                  )
+
+                  found = 0
+
+                  for a in soup.find_all(
+                      "a",
+                      href=True,
+                  ):
+                      href = urljoin(
+                          search_url,
+                          a["href"],
+                      ).split("?")[0].rstrip("/")
+
+                      low = href.lower()
+
+                      if (
+                          BASE in href
+                          and "/content/" in href
+                          and any(
+                              token in low
+                              for token in (
+                                  "humanitarian-situation-update",
+                                  "humanitarian-situation-report",
+                                  "gaza-humanitarian-response-situation-report",
+                                  "humanitarian-access-snapshot",
+                              )
+                          )
+                      ):
+                          urls.add(href)
+                          found += 1
+
+                  # Stop paging a query once OCHA search yields no useful links.
+                  if found == 0 and page_num >= 2:
+                      break
+
+          # Fallback discovery by OCHA's numbered Situation Update series.
+          # These are SOURCE URL guesses only; 404s are ignored.
+          # This does not contain or assume any historical statistics.
+          for number in range(150, 330):
+              urls.add(
+                  BASE
+                  + f"/content/humanitarian-situation-update-{number}-gaza-strip"
+              )
+
+          # Numbered Gaza Humanitarian Response series.
+          for number in range(1, 100):
+              urls.add(
+                  BASE
+                  + f"/content/gaza-humanitarian-response-situation-report-no-{number}"
+              )
+
+          # Date-slug situation reports for 2026 onward.
+          start = datetime(2026, 1, 1).date()
+          today = datetime.now(timezone.utc).date()
+          d = start
+
+          while d <= today:
+              slug = (
+                  f"{d.day}-"
+                  f"{d.strftime('%B').lower()}-"
+                  f"{d.year}"
+              )
+
+              urls.add(
+                  BASE
+                  + f"/content/humanitarian-situation-report-{slug}"
+              )
+
+              d += timedelta(days=1)
+
+          print(
+              "Candidate OCHA URLs:",
+              len(urls),
+          )
+
+          # ---------------------------------------------------------
+          # PARSE
+          # ---------------------------------------------------------
+
+          extracted = []
+
+          for index, url in enumerate(
+              sorted(urls),
+              start=1,
+          ):
+              records = parse_page(url)
+
+              for r in records:
+                  # Keep only Gaza-wide records for this timeline.
+                  if r["scope"] != "Gaza Strip":
+                      continue
+
+                  extracted.append(r)
+
+                  print(
+                      "VALID",
+                      r["date"],
+                      r["total"],
+                      r["facilitated"],
+                      r["impeded"],
+                      r["denied"],
+                      r["cancelled"],
+                      r["url"],
+                  )
+
+              if index % 100 == 0:
+                  print(
+                      f"Scanned {index}/{len(urls)} candidate URLs"
+                  )
+
+          # ---------------------------------------------------------
+          # DE-DUPLICATE
+          # ---------------------------------------------------------
+
+          # Same period can appear in a later OCHA report as a recap.
+          # Use numerical signature + period text to remove exact repeats.
+          unique = {}
+
+          for r in extracted:
+              key = (
+                  r["period"].lower(),
+                  r["total"],
+                  r["facilitated"],
+                  r["impeded"],
+                  r["denied"],
+                  r["cancelled"],
+              )
+
+              # Prefer the earlier publication when two reports repeat the
+              # identical period/statistics.
+              if (
+                  key not in unique
+                  or r["date"] < unique[key]["date"]
+              ):
+                  unique[key] = r
+
+          records = sorted(
+              unique.values(),
+              key=lambda r: (
+                  r["date"],
+                  r["total"],
+              ),
+          )
+
+          # ---------------------------------------------------------
+          # FINAL VALIDATION
+          # ---------------------------------------------------------
+
+          if len(records) < 15:
+              raise RuntimeError(
+                  f"Only {len(records)} comparable OCHA periods "
+                  "were extracted. Refusing to replace the existing dataset."
+              )
+
+          for r in records:
+              total = int(r["total"])
+
+              parts = sum(
+                  int(r[k])
+                  for k in (
+                      "facilitated",
+                      "impeded",
+                      "denied",
+                      "cancelled",
+                      "other",
+                  )
+              )
+
+              if parts != total:
+                  raise RuntimeError(
+                      f"Arithmetic validation failure: {r}"
+                  )
+
+              if not (
+                  0 <= r["denied"] <= total
+                  and 0 <= r["facilitated"] <= total
+              ):
+                  raise RuntimeError(
+                      f"Range validation failure: {r}"
+                  )
+
+          payload = {
+              "generated_at": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "source": (
+                  "United Nations Office for the Coordination "
+                  "of Humanitarian Affairs (OCHA), occupied "
+                  "Palestinian territory"
+              ),
+              "method": (
+                  "Entire timeline rebuilt from OCHA source pages on every "
+                  "run using one parser for historical and current reports. "
+                  "No historical benchmark JSON, manual values, interpolation "
+                  "or carry-forward is used."
+              ),
+              "records": records,
+          }
+
+          OUT.parent.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          tmp = OUT.with_suffix(
+              ".tmp"
+          )
+
+          tmp.write_text(
+              json.dumps(
+                  payload,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+
+          # Re-open before atomic publication.
+          check = json.loads(
+              tmp.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          if (
+              len(check.get("records", []))
+              != len(records)
+          ):
+              raise RuntimeError(
+                  "Final JSON validation failed"
+              )
+
+          tmp.replace(OUT)
+
+          print()
+          print(
+              "VALID SOURCE-FIRST OCHA ACCESS TIMELINE"
+          )
+          print(
+              "Comparable periods:",
+              len(records),
+          )
+          print(
+              "First:",
+              records[0]["date"],
+          )
+          print(
+              "Last:",
+              records[-1]["date"],
+          )
+          PY
+
+      - name: Commit OCHA access data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/ocha-access-denials.json
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Rebuild OCHA humanitarian access timeline"
+
+          git pull --rebase origin main
+          git push origin main
