@@ -1,0 +1,486 @@
+name: Update identified victims dataset
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "55 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download and validate Tech for Palestine victims dataset
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import os
+          import tempfile
+          import urllib.request
+          from pathlib import Path
+
+          CSV_URL = "https://data.techforpalestine.org/api/v3/killed-in-gaza.csv"
+          SUMMARY_URL = "https://data.techforpalestine.org/api/v3/summary.min.json"
+
+          OUT = Path("data/killed-in-gaza-v3.min.json")
+          META = Path("data/killed-in-gaza-v3.meta.json")
+
+          HEADERS = {
+              "User-Agent": "GazaTimeline-Victims/3.0",
+              "Accept": "text/csv,application/json",
+          }
+
+          def fetch_bytes(url, timeout=120):
+              request = urllib.request.Request(
+                  url,
+                  headers=HEADERS,
+              )
+
+              with urllib.request.urlopen(
+                  request,
+                  timeout=timeout,
+              ) as response:
+                  if response.status != 200:
+                      raise RuntimeError(
+                          f"HTTP {response.status}: {url}"
+                      )
+
+                  return response.read()
+
+          # -----------------------------------------
+          # Read Summary first.
+          # -----------------------------------------
+
+          summary = json.loads(
+              fetch_bytes(
+                  SUMMARY_URL,
+                  timeout=45,
+              )
+          )
+
+          try:
+              known = summary[
+                  "known_killed_in_gaza"
+              ]
+          except Exception:
+              raise RuntimeError(
+                  "Summary JSON missing known_killed_in_gaza"
+              )
+
+          expected_records = int(
+              known["records"]
+          )
+
+          if expected_records < 50_000:
+              raise RuntimeError(
+                  f"Summary record count is unexpectedly "
+                  f"small: {expected_records:,}"
+              )
+
+          print(
+              "Summary:",
+              f"records={expected_records:,}",
+              f"includes_until={known.get('includes_until')}",
+              f"last_update={known.get('last_update')}",
+          )
+
+          # -----------------------------------------
+          # ONE request for the entire names list.
+          # -----------------------------------------
+
+          csv_bytes = fetch_bytes(
+              CSV_URL,
+              timeout=180,
+          )
+
+          if len(csv_bytes) < 1_000_000:
+              raise RuntimeError(
+                  f"CSV download is suspiciously small: "
+                  f"{len(csv_bytes):,} bytes"
+              )
+
+          text = csv_bytes.decode(
+              "utf-8-sig"
+          )
+
+          reader = csv.DictReader(
+              io.StringIO(text)
+          )
+
+          if not reader.fieldnames:
+              raise RuntimeError(
+                  "CSV has no header"
+              )
+
+          fieldnames = [
+              str(x).strip()
+              for x in reader.fieldnames
+          ]
+
+          print(
+              "CSV fields:",
+              fieldnames,
+          )
+
+          required = {
+              "ar_name",
+              "en_name",
+              "sex",
+              "age",
+          }
+
+          missing = required - set(
+              fieldnames
+          )
+
+          if missing:
+              raise RuntimeError(
+                  f"CSV missing required fields: "
+                  f"{sorted(missing)}"
+              )
+
+          records = list(
+              reader
+          )
+
+          if len(records) != expected_records:
+              raise RuntimeError(
+                  f"CSV contains {len(records):,} rows, "
+                  f"but Summary says {expected_records:,}. "
+                  f"Refusing to publish mismatched snapshot."
+              )
+
+          # -----------------------------------------
+          # Validate every record and convert to the
+          # exact compact local format already used
+          # by the Victims tab.
+          # -----------------------------------------
+
+          valid_names = 0
+          valid_sex = 0
+          valid_age = 0
+
+          output_rows = []
+
+          for index, row in enumerate(
+              records,
+              start=1,
+          ):
+              # Tech for Palestine's live v3 CSV uses ar_name for
+              # the Arabic name. Convert it to the local "name"
+              # field expected by the existing Victims tab.
+              name = (
+                  row.get("ar_name")
+                  or ""
+              ).strip()
+
+              en_name = (
+                  row.get("en_name")
+                  or ""
+              ).strip()
+
+              record_id = (
+                  row.get("id")
+                  or ""
+              ).strip()
+
+              dob = (
+                  row.get("dob")
+                  or ""
+              ).strip()
+
+              sex = (
+                  row.get("sex")
+                  or ""
+              ).strip().lower()
+
+              update_raw = (
+                  row.get("update")
+                  or ""
+              ).strip()
+
+              age_raw = (
+                  row.get("age")
+                  or ""
+              ).strip()
+
+              if name or en_name:
+                  valid_names += 1
+
+              if sex in (
+                  "m",
+                  "f",
+              ):
+                  valid_sex += 1
+
+              age = None
+
+              if age_raw:
+                  try:
+                      numeric_age = float(
+                          age_raw
+                      )
+                  except Exception:
+                      raise RuntimeError(
+                          f"Row {index}: invalid age "
+                          f"{age_raw!r}"
+                      )
+
+                  if not (
+                      0
+                      <= numeric_age
+                      <= 120
+                  ):
+                      raise RuntimeError(
+                          f"Row {index}: implausible age "
+                          f"{numeric_age}"
+                      )
+
+                  if numeric_age.is_integer():
+                      age = int(
+                          numeric_age
+                      )
+                  else:
+                      age = numeric_age
+
+                  valid_age += 1
+
+              update = None
+
+              if update_raw:
+                  try:
+                      update = int(
+                          float(update_raw)
+                      )
+                  except Exception:
+                      # update is useful metadata but not
+                      # needed for the visualization.
+                      update = None
+
+              output_rows.append([
+                  name,
+                  en_name,
+                  record_id,
+                  dob,
+                  sex,
+                  age,
+                  update,
+              ])
+
+          if valid_names < len(records) * 0.95:
+              raise RuntimeError(
+                  "More than 5% of rows lack both "
+                  "Arabic and English names"
+              )
+
+          if valid_sex < len(records) * 0.90:
+              raise RuntimeError(
+                  "More than 10% of rows have an "
+                  "unexpected sex value"
+              )
+
+          # Age can legitimately be unavailable for
+          # some records. Validate values that exist,
+          # but do not invent missing ages.
+          if valid_age < len(records) * 0.50:
+              print(
+                  "WARNING:",
+                  f"only {valid_age:,}/{len(records):,} "
+                  f"rows have usable age"
+              )
+
+          local_data = [
+              [
+                  "name",
+                  "en_name",
+                  "id",
+                  "dob",
+                  "sex",
+                  "age",
+                  "update",
+              ]
+          ] + output_rows
+
+          # -----------------------------------------
+          # Re-read Summary after the CSV download.
+          # If a new list appeared during the fetch,
+          # wait for the next workflow run rather
+          # than publish a mixed snapshot.
+          # -----------------------------------------
+
+          summary_after = json.loads(
+              fetch_bytes(
+                  SUMMARY_URL,
+                  timeout=45,
+              )
+          )
+
+          known_after = summary_after.get(
+              "known_killed_in_gaza",
+              {},
+          )
+
+          if int(
+              known_after.get(
+                  "records",
+                  -1,
+              )
+          ) != expected_records:
+              raise RuntimeError(
+                  "Victims dataset changed while downloading. "
+                  "Refusing to publish; rerun the workflow."
+              )
+
+          # -----------------------------------------
+          # Atomic write.
+          # -----------------------------------------
+
+          OUT.parent.mkdir(
+              exist_ok=True
+          )
+
+          encoded = json.dumps(
+              local_data,
+              ensure_ascii=False,
+              separators=(",", ":"),
+          ).encode(
+              "utf-8"
+          )
+
+          with tempfile.NamedTemporaryFile(
+              mode="wb",
+              dir=OUT.parent,
+              delete=False,
+              prefix="victims-",
+              suffix=".tmp",
+          ) as tmp:
+              tmp.write(
+                  encoded
+              )
+
+              tmp_path = Path(
+                  tmp.name
+              )
+
+          check = json.loads(
+              tmp_path.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          if len(check) - 1 != expected_records:
+              tmp_path.unlink(
+                  missing_ok=True
+              )
+
+              raise RuntimeError(
+                  "Final local JSON validation failed"
+              )
+
+          os.replace(
+              tmp_path,
+              OUT,
+          )
+
+          META.write_text(
+              json.dumps(
+                  {
+                      "source": (
+                          "Tech for Palestine — "
+                          "Killed in Gaza v3 CSV"
+                      ),
+                      "source_fields": [
+                          "id",
+                          "en_name",
+                          "ar_name",
+                          "age",
+                          "dob",
+                          "sex",
+                          "update"
+                      ],
+                      "source_url": CSV_URL,
+                      "records": expected_records,
+                      "valid_names": valid_names,
+                      "valid_sex": valid_sex,
+                      "valid_age": valid_age,
+                      "includes_until": known_after.get(
+                          "includes_until"
+                      ),
+                      "last_update": known_after.get(
+                          "last_update"
+                      ),
+                      "local_format": [
+                          "name",
+                          "en_name",
+                          "id",
+                          "dob",
+                          "sex",
+                          "age",
+                          "update",
+                      ],
+                  },
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+              encoding="utf-8",
+          )
+
+          print()
+          print(
+              "VALID victims snapshot"
+          )
+          print(
+              "Records:",
+              f"{expected_records:,}"
+          )
+          print(
+              "Names:",
+              f"{valid_names:,}"
+          )
+          print(
+              "Usable ages:",
+              f"{valid_age:,}"
+          )
+          print(
+              "Valid sex:",
+              f"{valid_sex:,}"
+          )
+          print(
+              "Includes until:",
+              known_after.get(
+                  "includes_until"
+              )
+          )
+          print(
+              "Dataset last update:",
+              known_after.get(
+                  "last_update"
+              )
+          )
+          PY
+
+      - name: Commit victims data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/killed-in-gaza-v3.min.json data/killed-in-gaza-v3.meta.json
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Update identified victims dataset"
+
+          git pull --rebase origin main
+          git push origin main
