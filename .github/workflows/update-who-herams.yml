@@ -1,0 +1,110 @@
+name: Update WHO HeRAMS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4 pypdf
+      - name: Build validated WHO HeRAMS data
+        run: |
+          python - <<'PY'
+          import io,json,re
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT=Path("data/who-herams.json")
+          S=requests.Session()
+          S.headers["User-Agent"]="GazaTimeline-HeRAMS/1.0"
+          months=[]
+          for y in (2024,2025,2026):
+            for m in range(1,13):
+              if y==2024 and m<4: continue
+              months.append((y,m))
+
+          def get(url):
+            r=S.get(url,timeout=90); r.raise_for_status(); return r
+
+          def n(pattern,text):
+            m=re.search(pattern,text,re.I|re.S)
+            return int(m.group(1).replace(",","")) if m else None
+
+          records=[]
+          for y,m in months:
+            page=f"https://www.who.int/publications/m/item/herams-opt-gaza-infographics-{y}-{m:02d}"
+            try:
+              r=get(page)
+              if r.status_code!=200: continue
+              soup=BeautifulSoup(r.text,"html.parser")
+              body=soup.get_text(" ",strip=True)
+              dm=re.search(r"data reported up to\s+(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})",body,re.I)
+              if not dm: continue
+              from datetime import datetime as DT
+              date=DT.strptime(" ".join(dm.groups()),"%d %B %Y").date().isoformat()
+              pdf=None
+              for a in soup.find_all("a",href=True):
+                href=a["href"]
+                if "cdn.who.int" in href and (".pdf" in href.lower() or "Download" in a.get_text()):
+                  pdf=href; break
+              text=""
+              if pdf:
+                try:
+                  pr=get(pdf)
+                  reader=PdfReader(io.BytesIO(pr.content))
+                  text="\n".join((p.extract_text() or "") for p in reader.pages)
+                except Exception as e:
+                  print("PDF parse warning",page,e)
+              # Conservative patterns: only publish when exact status wording is found.
+              full=n(r"(?:fully operational|operational\s*-\s*fully)\D{0,30}(\d[\d,]*)",text)
+              partial=n(r"(?:partially operational|operational\s*-\s*partially)\D{0,30}(\d[\d,]*)",text)
+              non=n(r"(?:not operational|non[- ]functional|not functioning)\D{0,30}(\d[\d,]*)",text)
+              total=None
+              vals=[v for v in (full,partial,non) if v is not None]
+              if len(vals)==3: total=sum(vals)
+              records.append({
+                "date":date,"title":f"HeRAMS Gaza infographics {y}-{m:02d}",
+                "url":page,"fully_operational":full,"partially_operational":partial,
+                "not_operational":non,"assessed_total":total,
+                "note":"Operational-status totals are shown only when the PDF text could be parsed conservatively."
+              })
+            except Exception as e:
+              print("skip",page,e)
+
+          if not records:
+            if OUT.exists():
+              print("No new valid records; retaining existing JSON.")
+              raise SystemExit(0)
+            raise SystemExit("No valid WHO records and no previous file.")
+
+          payload={"generated_at":datetime.now(timezone.utc).isoformat(),"source":"WHO HeRAMS","records":records}
+          OUT.parent.mkdir(exist_ok=True)
+          tmp=OUT.with_suffix(".tmp")
+          tmp.write_text(json.dumps(payload,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          json.loads(tmp.read_text())
+          tmp.replace(OUT)
+          print("WHO records",len(records),"through",records[-1]["date"])
+          PY
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/who-herams.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update WHO HeRAMS data"
+          git pull --rebase origin main
+          git push origin main

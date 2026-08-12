@@ -1,0 +1,103 @@
+name: Update UNOSAT satellite damage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "40 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4
+      - name: Build validated UNOSAT assessment timeline
+        run: |
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path("data/unosat-damage.json")
+          S=requests.Session(); S.headers["User-Agent"]="GazaTimeline-UNOSAT/1.0"
+
+          # Known Gaza-wide comprehensive assessments; discovery extends this list.
+          ids={3734,3769,3793,4047,4130,4165,4213}
+          # Scan a conservative recent product-id range for future Gaza-wide assessments.
+          ids.update(range(4214,4351))
+
+          def parse_num(p,t):
+            m=re.search(p,t,re.I|re.S)
+            return int(m.group(1).replace(",","")) if m else None
+
+          records=[]
+          for pid in sorted(ids):
+            url=f"https://unosat.org/products/{pid}"
+            try:
+              r=S.get(url,timeout=25)
+              if r.status_code!=200: continue
+              soup=BeautifulSoup(r.text,"html.parser")
+              text=" ".join(soup.stripped_strings)
+              title=soup.find("h3").get_text(" ",strip=True) if soup.find("h3") else ""
+              if "Gaza Strip Comprehensive Damage Assessment" not in text: continue
+              # Exclude road/greenhouse/city-only products.
+              if "Road Network" in text or "greenhouse" in text.lower() or "Gaza Governorate Comprehensive" in text: continue
+
+              dm=re.search(r"(?:images?|imagery)\s+(?:collected|based on images collected|based on an image collected)\s+on\s+(?:the\s+)?(\d{1,2})(?:[–-]\d{1,2})?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",text,re.I)
+              if not dm:
+                dm=re.search(r"as of\s+(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",text,re.I)
+              if not dm: continue
+              date=datetime.strptime(" ".join(dm.groups()),"%d %B %Y").date().isoformat()
+
+              destroyed=parse_num(r"([\d,]+)\s+destroyed structures",text)
+              severe=parse_num(r"([\d,]+)\s+severely damaged structures",text)
+              moderate=parse_num(r"([\d,]+)\s+moderately damaged structures",text)
+              possible=parse_num(r"([\d,]+)\s+possibly damaged structures",text)
+              total=parse_num(r"(?:total of|totalling)\s+([\d,]+)\s+(?:affected|structures)",text)
+              housing=parse_num(r"([\d,]+)\s+(?:estimated\s+)?damaged housing units",text)
+              pct=None
+              pm=re.search(r"(?:around|approximately)?\s*(\d+(?:\.\d+)?)%\s+of (?:the )?(?:total |all )?structures",text,re.I)
+              if pm: pct=float(pm.group(1))
+              if not destroyed or not total: continue
+              if total < destroyed: continue
+              records.append({"date":date,"product_id":pid,"title":"UNOSAT Gaza Strip Comprehensive Damage Assessment","url":url,
+                "destroyed":destroyed,"severe":severe,"moderate":moderate,"possible":possible,"total_affected":total,
+                "housing_units":housing,"percent_structures":pct})
+            except Exception as e:
+              print("skip",pid,e)
+
+          # unique assessment date, prefer highest product id
+          bydate={}
+          for r in records:
+            if r["date"] not in bydate or r["product_id"]>bydate[r["date"]]["product_id"]: bydate[r["date"]]=r
+          records=sorted(bydate.values(),key=lambda r:r["date"])
+
+          if not records:
+            if OUT.exists():
+              print("No valid new UNOSAT records; retaining existing JSON."); raise SystemExit(0)
+            raise SystemExit("No valid UNOSAT records and no previous file.")
+
+          OUT.parent.mkdir(exist_ok=True)
+          tmp=OUT.with_suffix(".tmp")
+          tmp.write_text(json.dumps({"generated_at":datetime.now(timezone.utc).isoformat(),"source":"UNOSAT","records":records},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          json.loads(tmp.read_text()); tmp.replace(OUT)
+          print("UNOSAT assessments",len(records),"through",records[-1]["date"])
+          PY
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/unosat-damage.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update UNOSAT satellite damage data"
+          git pull --rebase origin main
+          git push origin main
