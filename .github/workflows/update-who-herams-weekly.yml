@@ -1,0 +1,529 @@
+name: Update validated WHO HeRAMS weekly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pdfplumber
+
+      - name: Build validated WHO HeRAMS data
+        run: |
+          python - <<'PY'
+
+          import io
+          import json
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          import pdfplumber
+          from bs4 import BeautifulSoup
+
+          OUT = Path("data/who-herams.json")
+          LATEST = "https://www.who.int/publications/m/item/herams-opt-gaza-infographics-2026-06"
+
+          S = requests.Session()
+          S.headers.update({
+              "User-Agent": "GazaTimeline-HeRAMS/4.0",
+              "Accept-Language": "en",
+          })
+
+          MONTHS = (
+              "January|February|March|April|May|June|July|August|"
+              "September|October|November|December"
+          )
+
+          def get(url, timeout=30):
+              r = S.get(url, timeout=timeout)
+              r.raise_for_status()
+              return r
+
+          def clean_url(url):
+              return url.split("#")[0].split("?")[0]
+
+          def parse_page(url):
+              r = get(url, 20)
+              soup = BeautifulSoup(r.text, "html.parser")
+
+              h1 = soup.find("h1")
+              title = h1.get_text(" ", strip=True) if h1 else ""
+              text = " ".join(soup.stripped_strings)
+
+              if "HeRAMS" not in title or "Gaza" not in title:
+                  return None, None, soup
+
+              dm = re.search(
+                  rf"data reported up to\s+(\d{{1,2}})\s+({MONTHS})\s+(20\d{{2}})",
+                  text,
+                  re.I,
+              )
+
+              if not dm:
+                  dm = re.search(
+                      rf"based on data reported up to\s+({MONTHS})\s+(\d{{1,2}}),\s*(20\d{{2}})",
+                      text,
+                      re.I,
+                  )
+                  if dm:
+                      date = datetime.strptime(
+                          f"{dm.group(2)} {dm.group(1)} {dm.group(3)}",
+                          "%d %B %Y",
+                      ).date().isoformat()
+                  else:
+                      return None, None, soup
+              else:
+                  date = datetime.strptime(
+                      " ".join(dm.groups()),
+                      "%d %B %Y",
+                  ).date().isoformat()
+
+              pub = None
+              for pm in re.finditer(
+                  rf"\b(\d{{1,2}})\s+({MONTHS})\s+(20\d{{2}})\b",
+                  text,
+                  re.I,
+              ):
+                  candidate = datetime.strptime(
+                      " ".join(pm.groups()),
+                      "%d %B %Y",
+                  ).date().isoformat()
+                  if candidate >= date:
+                      pub = candidate
+                      break
+
+              low = title.lower()
+              if "governmental hospitals" in low:
+                  report_type = "Governmental hospitals"
+              elif "field hospitals" in low:
+                  report_type = "Field hospitals"
+              elif "all hospitals" in low:
+                  report_type = "All hospitals"
+              elif "governorate" in low:
+                  report_type = "By governorate"
+              elif "hsdu type" in low:
+                  report_type = "By HSDU type"
+              else:
+                  report_type = "Gaza infographics"
+
+              pdf_url = None
+              for a in soup.find_all("a", href=True):
+                  href = urljoin(url, a["href"])
+                  if "cdn.who.int" in href and ".pdf" in href.lower():
+                      pdf_url = href
+                      break
+
+              record = {
+                  "date": date,
+                  "publication_date": pub,
+                  "title": title,
+                  "url": clean_url(url),
+                  "pdf_url": pdf_url,
+                  "report_type": report_type,
+                  "coverage": f"WHO HeRAMS Gaza assessment; data reported through {date}.",
+
+                  # Existing index compatibility:
+                  "fully_operational": None,
+                  "partially_operational": None,
+                  "not_operational": None,
+                  "operational_unit": None,
+
+                  # Exact WHO terminology:
+                  "functioning": None,
+                  "partially_functioning": None,
+                  "non_functioning": None,
+                  "destroyed": None,
+                  "evaluated_hsdus": None,
+
+                  "validation": None,
+              }
+
+              return record, pdf_url, soup
+
+          def discover_all():
+              record, pdf, soup = parse_page(LATEST)
+              urls = {clean_url(LATEST)}
+
+              for a in soup.find_all("a", href=True):
+                  href = clean_url(urljoin(LATEST, a["href"]))
+                  low = href.lower()
+
+                  if (
+                      "/publications/m/item/" in low
+                      and "herams-opt-gaza-" in low
+                      and "/ar/" not in low
+                  ):
+                      urls.add(href)
+
+              return sorted(urls)
+
+          def normalize_text(s):
+              s = (
+                  s.replace("\u00ad", "")
+                   .replace("\u2010", "-")
+                   .replace("\u2011", "-")
+                   .replace("\u2012", "-")
+                   .replace("\u2013", "-")
+                   .replace("\u2014", "-")
+              )
+              s = re.sub(r"\s+", " ", s)
+              return s.strip()
+
+          def find_count(block, label_patterns):
+              """
+              Supports both:
+                10 Functioning
+                Functioning 10
+              while staying inside the validated HSDU-status block.
+              """
+              for label in label_patterns:
+                  patterns = [
+                      rf"\b(\d{{1,3}})\s+{label}\b",
+                      rf"\b{label}\s+(\d{{1,3}})\b",
+                  ]
+                  for pat in patterns:
+                      m = re.search(pat, block, re.I)
+                      if m:
+                          return int(m.group(1))
+              return None
+
+          def extract_status(pdf_url):
+              raw = get(pdf_url, 75).content
+
+              with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                  # The all-HSDU status panel appears near the front. Limiting pages
+                  # reduces both false positives and run time.
+                  for page_number, page in enumerate(pdf.pages[:12], start=1):
+                      layout = page.extract_text(
+                          x_tolerance=2,
+                          y_tolerance=2,
+                          layout=True,
+                      ) or ""
+
+                      plain = normalize_text(layout)
+
+                      if not re.search(r"HSDU\s+STATUS", plain, re.I):
+                          continue
+
+                      if not re.search(r"\bFunctionality\b", plain, re.I):
+                          continue
+
+                      # Restrict extraction to the HSDU STATUS portion before the
+                      # "MAIN CAUSES" explanatory column when possible.
+                      start_match = re.search(r"HSDU\s+STATUS", plain, re.I)
+                      start = start_match.start() if start_match else 0
+
+                      end_match = re.search(
+                          r"\bMAIN\s+CAUSES\b",
+                          plain[start:],
+                          re.I,
+                      )
+                      end = (
+                          start + end_match.start()
+                          if end_match
+                          else min(len(plain), start + 5000)
+                      )
+
+                      block = plain[start:end]
+
+                      evaluated = None
+                      em = re.search(
+                          r"Out\s+of\s+(\d{1,3})\s+HSDUs?\s+evaluated",
+                          block,
+                          re.I,
+                      )
+                      if em:
+                          evaluated = int(em.group(1))
+
+                      functioning = find_count(
+                          block,
+                          [r"Functioning"],
+                      )
+
+                      partial = find_count(
+                          block,
+                          [
+                              r"Partially\s+Functioning",
+                              r"Partially\s+functional",
+                          ],
+                      )
+
+                      non = find_count(
+                          block,
+                          [
+                              r"Non[-\s]?Functioning",
+                              r"Non[-\s]?functional",
+                              r"Not\s+Functioning",
+                          ],
+                      )
+
+                      destroyed = find_count(
+                          block,
+                          [r"Destroyed"],
+                      )
+
+                      values = {
+                          "functioning": functioning,
+                          "partially_functioning": partial,
+                          "non_functioning": non,
+                          "destroyed": destroyed,
+                          "evaluated_hsdus": evaluated,
+                      }
+
+                      print(
+                          "STATUS CANDIDATE",
+                          "page", page_number,
+                          values,
+                      )
+
+                      if any(v is None for v in values.values()):
+                          continue
+
+                      total = functioning + partial + non + destroyed
+
+                      # HARD VALIDATION:
+                      # WHO's four Functionality categories must account for every
+                      # evaluated HSDU. Reject anything else.
+                      if total != evaluated:
+                          print(
+                              "REJECT status block:",
+                              total,
+                              "category total vs",
+                              evaluated,
+                              "evaluated",
+                          )
+                          continue
+
+                      # Additional sanity constraints.
+                      if evaluated <= 0 or evaluated > 500:
+                          continue
+
+                      if any(
+                          v < 0 or v > evaluated
+                          for v in (
+                              functioning,
+                              partial,
+                              non,
+                              destroyed,
+                          )
+                      ):
+                          continue
+
+                      at_least_partial = functioning + partial
+                      pct = 100.0 * at_least_partial / evaluated
+
+                      # Existing site's three cards:
+                      # "fully_operational" = WHO "Functioning"
+                      # "partially_operational" = WHO "Partially Functioning"
+                      # "not_operational" = WHO "Non-Functioning" + "Destroyed"
+                      #
+                      # Exact WHO categories are stored separately above.
+                      return {
+                          "fully_operational": functioning,
+                          "partially_operational": partial,
+                          "not_operational": non + destroyed,
+                          "operational_unit": "count",
+
+                          "functioning": functioning,
+                          "partially_functioning": partial,
+                          "non_functioning": non,
+                          "destroyed": destroyed,
+                          "evaluated_hsdus": evaluated,
+
+                          "at_least_partially_functioning": at_least_partial,
+                          "at_least_partially_functioning_pct": round(pct, 1),
+
+                          "validation": (
+                              f"Validated: {functioning} Functioning + "
+                              f"{partial} Partially Functioning + "
+                              f"{non} Non-Functioning + {destroyed} Destroyed "
+                              f"= {evaluated} evaluated HSDUs."
+                          ),
+                      }
+
+              return None
+
+          def load_existing():
+              if not OUT.exists():
+                  return {}
+
+              try:
+                  data = json.loads(
+                      OUT.read_text(encoding="utf-8")
+                  )
+                  return {
+                      r["url"]: r
+                      for r in data.get("records", [])
+                      if r.get("url")
+                  }
+              except Exception:
+                  return {}
+
+          def save(records):
+              records = sorted(
+                  records,
+                  key=lambda r: (
+                      r["date"],
+                      r.get("title", ""),
+                  ),
+              )
+
+              if not records:
+                  raise RuntimeError("Refusing to write empty WHO dataset.")
+
+              payload = {
+                  "generated_at": datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+                  "source": "World Health Organization (WHO) HeRAMS",
+                  "method": (
+                      "Operational counts are extracted only from the WHO HSDU STATUS "
+                      "Functionality block and accepted only when Functioning + Partially "
+                      "Functioning + Non-Functioning + Destroyed exactly equals the "
+                      "reported number of evaluated HSDUs."
+                  ),
+                  "records": records,
+              }
+
+              OUT.parent.mkdir(exist_ok=True)
+
+              tmp = OUT.with_suffix(".tmp")
+
+              tmp.write_text(
+                  json.dumps(
+                      payload,
+                      ensure_ascii=False,
+                      separators=(",", ":"),
+                  ),
+                  encoding="utf-8",
+              )
+
+              # Validate JSON before replacing current good file.
+              json.loads(
+                  tmp.read_text(encoding="utf-8")
+              )
+
+              tmp.replace(OUT)
+
+              valid = sum(
+                  1
+                  for r in records
+                  if r.get("validation")
+              )
+
+              print(
+                  "Saved",
+                  len(records),
+                  "reports;",
+                  valid,
+                  "with validated HSDU status values;",
+                  "latest date",
+                  records[-1]["date"],
+              )
+
+
+          existing = load_existing()
+          urls = discover_all()
+
+          new_records = []
+
+          for url in urls:
+              if url in existing:
+                  continue
+
+              try:
+                  record, pdf_url, soup = parse_page(url)
+
+                  if record:
+                      new_records.append(
+                          (record, pdf_url)
+                      )
+
+              except Exception as error:
+                  print(
+                      "NEW PAGE warning:",
+                      url,
+                      error,
+                  )
+
+          if not new_records:
+              print(
+                  "No new WHO HeRAMS reports."
+              )
+              raise SystemExit(0)
+
+          # Weekly job processes only the NEWEST newly discovered report.
+          # This prevents historical re-processing every Monday.
+          record, pdf_url = max(
+              new_records,
+              key=lambda pair: pair[0]["date"],
+          )
+
+          print(
+              "New WHO report:",
+              record["date"],
+              record["url"],
+          )
+
+          if pdf_url:
+              try:
+                  status = extract_status(pdf_url)
+
+                  if status:
+                      record.update(status)
+
+                      print(
+                          "VALID",
+                          record["validation"],
+                      )
+                  else:
+                      print(
+                          "Report metadata is valid, but no HSDU status block passed "
+                          "the hard validation. Publishing metadata with blank values."
+                      )
+
+              except Exception as error:
+                  print(
+                      "Latest PDF warning:",
+                      error,
+                  )
+
+          existing[
+              record["url"]
+          ] = record
+
+          save(
+              list(existing.values())
+          )
+
+          PY
+
+      - name: Commit WHO HeRAMS data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/who-herams.json
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Update validated WHO HeRAMS data"
+          git pull --rebase origin main
+          git push origin main
