@@ -1,0 +1,148 @@
+name: Bootstrap WHO HeRAMS history
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4 pypdf
+      - name: Update WHO HeRAMS data
+        run: |
+          python - <<'PY'
+
+          import io,json,re
+          from datetime import datetime,timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT=Path("data/who-herams.json")
+          LATEST="https://www.who.int/publications/m/item/herams-opt-gaza-infographics-2026-06"
+          S=requests.Session()
+          S.headers.update({"User-Agent":"GazaTimeline-HeRAMS/3.0","Accept-Language":"en"})
+          MONTHS="January|February|March|April|May|June|July|August|September|October|November|December"
+
+          def get(url,timeout=25):
+              r=S.get(url,timeout=timeout); r.raise_for_status(); return r
+
+          def clean(url): return url.split("#")[0].split("?")[0]
+
+          def page_record(url):
+              r=get(url,20); soup=BeautifulSoup(r.text,"html.parser")
+              h1=soup.find("h1"); title=h1.get_text(" ",strip=True) if h1 else ""
+              text=" ".join(soup.stripped_strings)
+              if "HeRAMS" not in title or "Gaza" not in title: return None,None,soup
+              dm=re.search(rf"data reported up to\s+(\d{{1,2}})\s+({MONTHS})\s+(20\d{{2}})",text,re.I)
+              if dm:
+                  date=datetime.strptime(" ".join(dm.groups()),"%d %B %Y").date().isoformat()
+              else:
+                  dm=re.search(rf"based on data reported up to\s+({MONTHS})\s+(\d{{1,2}}),\s*(20\d{{2}})",text,re.I)
+                  if not dm:return None,None,soup
+                  date=datetime.strptime(f"{dm.group(2)} {dm.group(1)} {dm.group(3)}","%d %B %Y").date().isoformat()
+              pub=None
+              for pm in re.finditer(rf"\b(\d{{1,2}})\s+({MONTHS})\s+(20\d{{2}})\b",text,re.I):
+                  cand=datetime.strptime(" ".join(pm.groups()),"%d %B %Y").date().isoformat()
+                  if cand>=date: pub=cand; break
+              low=title.lower()
+              if "governmental hospitals" in low: typ="Governmental hospitals"
+              elif "field hospitals" in low: typ="Field hospitals"
+              elif "all hospitals" in low: typ="All hospitals"
+              elif "governorate" in low: typ="By governorate"
+              elif "hsdu type" in low: typ="By HSDU type"
+              else: typ="Gaza infographics"
+              rec={"date":date,"publication_date":pub,"title":title,"url":clean(url),"report_type":typ,
+                   "coverage":f"WHO HeRAMS Gaza assessment; data reported through {date}.",
+                   "fully_operational":None,"partially_operational":None,"not_operational":None,"operational_unit":None}
+              pdf=None
+              for a in soup.find_all("a",href=True):
+                  href=urljoin(url,a["href"])
+                  if "cdn.who.int" in href and ".pdf" in href.lower(): pdf=href; break
+              return rec,pdf,soup
+
+          def discover():
+              rec,pdf,soup=page_record(LATEST)
+              urls={clean(LATEST)}
+              for a in soup.find_all("a",href=True):
+                  href=clean(urljoin(LATEST,a["href"]))
+                  if "/publications/m/item/" in href and "herams-opt-gaza-" in href.lower() and "/ar/" not in href:
+                      urls.add(href)
+              return sorted(urls)
+
+          def extract(pdf):
+              r=get(pdf,60); reader=PdfReader(io.BytesIO(r.content))
+              text=re.sub(r"\s+"," ","\n".join((p.extract_text() or "") for p in reader.pages[:12]))
+              def pct(label):
+                  for p in (rf"{label}.{{0,60}}?(\d{{1,3}}(?:\.\d+)?)\s*%",rf"(\d{{1,3}}(?:\.\d+)?)\s*%.{{0,50}}?{label}"):
+                      m=re.search(p,text,re.I)
+                      if m:
+                          v=float(m.group(1))
+                          if 0<=v<=100:return v
+              full=pct(r"fully operational|fully functional")
+              partial=pct(r"partially operational|partially functional")
+              non=pct(r"not operational|non[- ]functional|not functioning")
+              if all(v is not None for v in (full,partial,non)) and 95<=full+partial+non<=105:
+                  return {"fully_operational":full,"partially_operational":partial,"not_operational":non,"operational_unit":"percent"}
+              return None
+
+          def load():
+              if not OUT.exists(): return {}
+              try:
+                  data=json.loads(OUT.read_text(encoding="utf-8"))
+                  return {r["url"]:r for r in data.get("records",[]) if r.get("url")}
+              except:return {}
+
+          def save(rows):
+              rows=sorted(rows,key=lambda r:(r["date"],r.get("title","")))
+              OUT.parent.mkdir(exist_ok=True)
+              tmp=OUT.with_suffix(".tmp")
+              tmp.write_text(json.dumps({"generated_at":datetime.now(timezone.utc).isoformat(),"source":"World Health Organization (WHO) HeRAMS","records":rows},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+              json.loads(tmp.read_text(encoding="utf-8")); tmp.replace(OUT)
+              print("Saved",len(rows),"reports through",rows[-1]["date"])
+
+          existing=load()
+          urls=discover()
+          print("WHO Gaza HeRAMS pages discovered:",len(urls))
+          rows=[]
+          for i,url in enumerate(urls,1):
+              try:
+                  rec,pdf,_=page_record(url)
+                  if not rec: continue
+                  old=existing.get(rec["url"])
+                  if old and old.get("operational_unit"):
+                      for k in ("fully_operational","partially_operational","not_operational","operational_unit"):
+                          rec[k]=old.get(k)
+                  elif pdf:
+                      try:
+                          m=extract(pdf)
+                          if m: rec.update(m)
+                      except Exception as e:
+                          print("PDF warning",rec["date"],e)
+                  rows.append(rec)
+                  print(i,rec["date"],rec["report_type"],"metrics" if rec["operational_unit"] else "metadata")
+              except Exception as e:
+                  print("Page warning",url,e)
+          if not rows: raise SystemExit("No WHO reports parsed.")
+          save(rows)
+
+          PY
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/who-herams.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update WHO HeRAMS data"
+          git pull --rebase origin main
+          git push origin main
