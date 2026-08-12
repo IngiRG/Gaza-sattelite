@@ -1,0 +1,286 @@
+name: Update OCHA humanitarian access
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "25 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Build OCHA humanitarian access timeline
+        run: |
+          python - <<'PY'
+          import json,re
+          from datetime import datetime,timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path("data/ocha-access.json")
+          S=requests.Session()
+          S.headers.update({"User-Agent":"GazaTimeline-OCHA/2.0"})
+
+          # Historical anchors from official OCHA pages.
+          # Blank values are intentional where OCHA did not publish an equivalent
+          # all-Gaza metric in the cited period.
+          records=[
+            {
+              "date":"2024-01-31",
+              "title":"Humanitarian Access Snapshot - Gaza Strip | End-January 2024",
+              "url":"https://www.ochaopt.org/content/humanitarian-access-snapshot-gaza-strip-end-january-2024",
+              "period":"January 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":75,"missions_denied":None,
+              "missions_impeded":None,"missions_cancelled":None,"fuel_litres":None
+            },
+            {
+              "date":"2024-02-29",
+              "title":"Humanitarian Access Snapshot - Gaza Strip | End-February 2024",
+              "url":"https://www.ochaopt.org/content/humanitarian-access-snapshot-gaza-strip-end-february-2024",
+              "period":"February 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":111,"missions_denied":None,
+              "missions_impeded":None,"missions_cancelled":None,"fuel_litres":None
+            },
+            {
+              "date":"2024-07-29",
+              "title":"Humanitarian Situation Update #199 | Gaza Strip",
+              "url":"https://www.ochaopt.org/content/humanitarian-situation-update-199-gaza-strip",
+              "period":"1–29 July 2024","scope":"Gaza Strip, north + south combined",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":317,"missions_denied":83,
+              "missions_impeded":88,"missions_cancelled":55,"fuel_litres":None
+            },
+            {
+              "date":"2024-08-31",
+              "title":"Humanitarian Situation Update #221 | Gaza Strip",
+              "url":"https://www.ochaopt.org/content/humanitarian-situation-update-221-gaza-strip",
+              "period":"August 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":250,"missions_denied":176,
+              "missions_impeded":99,"missions_cancelled":None,"fuel_litres":None
+            },
+            {
+              "date":"2024-09-30",
+              "title":"Humanitarian Access Snapshot - Gaza Strip | September 2024",
+              "url":"https://www.ochaopt.org/content/humanitarian-access-snapshot-gaza-strip-september-2024",
+              "period":"September 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":None,"missions_denied":138,
+              "missions_impeded":None,"missions_cancelled":None,"fuel_litres":220000
+            },
+            {
+              "date":"2024-10-28",
+              "title":"Humanitarian Situation Update #233 | Gaza Strip",
+              "url":"https://www.ochaopt.org/content/humanitarian-situation-update-233-gaza-strip",
+              "period":"1–28 October 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":212,"missions_denied":254,
+              "missions_impeded":92,"missions_cancelled":22,"fuel_litres":None
+            },
+            {
+              "date":"2024-12-23",
+              "title":"Humanitarian Situation Update #249 | Gaza Strip",
+              "url":"https://www.ochaopt.org/content/humanitarian-situation-update-249-gaza-strip",
+              "period":"1–23 December 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":159,"missions_denied":183,
+              "missions_impeded":75,"missions_cancelled":44,"fuel_litres":None
+            },
+            {
+              "date":"2024-12-31",
+              "title":"Humanitarian Situation Update #253 | Gaza Strip",
+              "url":"https://www.ochaopt.org/content/humanitarian-situation-update-253-gaza-strip",
+              "period":"Full year 2024","scope":"Gaza Strip",
+              "pallets_offloaded":None,"pallets_collected":None,
+              "missions_facilitated":2557,"missions_denied":1262,
+              "missions_impeded":1001,"missions_cancelled":None,"fuel_litres":None
+            },
+            {
+              "date":"2025-12-08",
+              "title":"Gaza Humanitarian Response | Situation Report No. 42",
+              "url":"https://www.ochaopt.org/content/gaza-humanitarian-response-situation-report-no-42",
+              "period":"8 December 2025","scope":"UN-coordinated aid at Gaza crossings",
+              "pallets_offloaded":3230,"pallets_collected":3954,
+              "missions_facilitated":8,"missions_denied":1,
+              "missions_impeded":1,"missions_cancelled":None,"fuel_litres":None
+            },
+            {
+              "date":"2026-02-05",
+              "title":"Gaza Humanitarian Response | Situation Report No. 66",
+              "url":"https://www.ochaopt.org/content/gaza-humanitarian-response-situation-report-no-66",
+              "period":"30 January–5 February 2026","scope":"Gaza Strip",
+              "pallets_offloaded":12452,"pallets_collected":13313,
+              "missions_facilitated":23,"missions_denied":11,
+              "missions_impeded":16,"missions_cancelled":8,"fuel_litres":806430
+            },
+            {
+              "date":"2026-02-19",
+              "title":"Gaza Humanitarian Response | Situation Report No. 68",
+              "url":"https://www.ochaopt.org/content/gaza-humanitarian-response-situation-report-no-68",
+              "period":"12–19 February 2026","scope":"Gaza Strip",
+              "pallets_offloaded":13000,"pallets_collected":8381,
+              "missions_facilitated":42,"missions_denied":9,
+              "missions_impeded":9,"missions_cancelled":7,"fuel_litres":None
+            },
+            {
+              "date":"2026-02-26",
+              "title":"Gaza Humanitarian Response | Situation Report No. 69",
+              "url":"https://www.ochaopt.org/content/gaza-humanitarian-response-situation-report-no-69",
+              "period":"20–26 February 2026","scope":"Gaza Strip",
+              "pallets_offloaded":7500,"pallets_collected":7200,
+              "missions_facilitated":None,"missions_denied":None,
+              "missions_impeded":None,"missions_cancelled":None,"fuel_litres":None
+            }
+          ]
+
+          # Preserve newer valid records already generated.
+          if OUT.exists():
+              try:
+                  old=json.loads(OUT.read_text(encoding="utf-8"))
+                  for r in old.get("records",[]):
+                      if r.get("date") and r.get("url"):
+                          records.append(r)
+              except Exception as e:
+                  print("Existing OCHA JSON warning:",e)
+
+          # Discover recent official reports so weekly updates can append new data.
+          discover=[
+              "https://www.ochaopt.org/search?search_api_fulltext=humanitarian%20situation%20report",
+              "https://www.ochaopt.org/search?search_api_fulltext=Gaza%20Humanitarian%20Response%20Situation%20Report",
+          ]
+
+          urls=set()
+          for u in discover:
+              try:
+                  rr=S.get(u,timeout=20); rr.raise_for_status()
+                  soup=BeautifulSoup(rr.text,"html.parser")
+                  for a in soup.find_all("a",href=True):
+                      h=urljoin(u,a["href"]).split("?")[0]
+                      if "ochaopt.org/content/" in h and (
+                          "humanitarian-situation-report" in h
+                          or "gaza-humanitarian-response-situation-report" in h
+                      ):
+                          urls.add(h)
+              except Exception as e:
+                  print("OCHA discovery warning:",e)
+
+          def integer(s):
+              if s is None:return None
+              try:return int(float(str(s).replace(",","")))
+              except:return None
+
+          def first(patterns,text):
+              for p in patterns:
+                  m=re.search(p,text,re.I|re.S)
+                  if m:
+                      return integer(m.group(1))
+              return None
+
+          # Conservative parser for newer report format.
+          for url in sorted(urls):
+              try:
+                  rr=S.get(url,timeout=20); rr.raise_for_status()
+                  soup=BeautifulSoup(rr.text,"html.parser")
+                  text=" ".join(soup.stripped_strings)
+                  h1=soup.find("h1")
+                  title=h1.get_text(" ",strip=True) if h1 else url.rsplit("/",1)[-1]
+
+                  meta=soup.find("meta",attrs={"property":"article:published_time"})
+                  date=(meta.get("content","")[:10] if meta else None)
+                  if not date:
+                      dm=re.search(
+                          r"\b(\d{1,2})\s+"
+                          r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+                          r"(20\d{2})\b",text,re.I
+                      )
+                      if dm:
+                          date=datetime.strptime(" ".join(dm.groups()),"%d %B %Y").date().isoformat()
+                  if not date or date<"2025-10-01":
+                      continue
+
+                  off=first([
+                      r"([\d,]+)\s+pallets[^.]{0,120}\boffloaded\b",
+                      r"at least\s+([\d,]+)\s+pallets[^.]{0,120}\boffloaded\b"
+                  ],text)
+                  col=first([
+                      r"([\d,]+)\s+pallets[^.]{0,120}\bcollected\b",
+                      r"collection of at least\s+([\d,]+)\s+pallets"
+                  ],text)
+
+                  # Mission counts only where explicit labelled counts appear.
+                  fac=first([r"\b(\d+)\s*(?:\([^)]*\))?\s*(?:were\s+)?facilitated\b"],text)
+                  den=first([r"\b(\d+)\s*(?:\([^)]*\))?\s*(?:were\s+)?denied(?:\s+outright)?\b"],text)
+                  imp=first([r"\b(\d+)\s*(?:\([^)]*\))?\s*(?:were\s+)?(?:approved but )?(?:faced\s+)?impediments?\b"],text)
+                  can=first([r"\b(\d+)\s*(?:\([^)]*\))?\s*(?:were\s+)?cancelled\b"],text)
+                  fuel=first([
+                      r"([\d,]+)\s+litres?\s+of\s+(?:diesel|fuel)[^.]{0,120}\b(?:collected|entered)\b",
+                      r"(?:collected|distributed)\s+([\d,]+)\s+litres?\s+of\s+(?:diesel|fuel)"
+                  ],text)
+
+                  if all(v is None for v in (off,col,fac,den,imp,can,fuel)):
+                      continue
+
+                  records.append({
+                      "date":date,"title":title,"url":url,
+                      "period":"See OCHA source for exact reporting period",
+                      "scope":"Gaza Strip / UN-coordinated humanitarian access",
+                      "pallets_offloaded":off,"pallets_collected":col,
+                      "missions_facilitated":fac,"missions_denied":den,
+                      "missions_impeded":imp,"missions_cancelled":can,
+                      "fuel_litres":fuel
+                  })
+              except Exception as e:
+                  print("OCHA skip",url,e)
+
+          # Deduplicate same URL/date; prefer record with more populated fields.
+          best={}
+          fields=("pallets_offloaded","pallets_collected","missions_facilitated","missions_denied","missions_impeded","missions_cancelled","fuel_litres")
+          for r in records:
+              key=(r.get("date"),r.get("url"))
+              score=sum(r.get(f) is not None for f in fields)
+              if key not in best or score>best[key][0]:
+                  best[key]=(score,r)
+
+          records=sorted((v[1] for v in best.values()),key=lambda r:(r["date"],r["url"]))
+
+          payload={
+              "generated_at":datetime.now(timezone.utc).isoformat(),
+              "source":"OCHA oPt / UN 2720",
+              "records":records
+          }
+
+          OUT.parent.mkdir(exist_ok=True)
+          tmp=OUT.with_suffix(".tmp")
+          tmp.write_text(json.dumps(payload,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          json.loads(tmp.read_text(encoding="utf-8"))
+          tmp.replace(OUT)
+          print("OCHA records:",len(records),"from",records[0]["date"],"through",records[-1]["date"])
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ocha-access.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update OCHA humanitarian access data"
+          git pull --rebase origin main
+          git push origin main

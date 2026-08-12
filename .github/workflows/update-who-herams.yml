@@ -1,0 +1,188 @@
+name: Update WHO HeRAMS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pypdf
+
+      - name: Update WHO HeRAMS safely
+        run: |
+          python - <<'PY'
+          import io, json, re
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT=Path("data/who-herams.json")
+          S=requests.Session()
+          S.headers.update({"User-Agent":"GazaTimeline-HeRAMS/2.0"})
+
+          existing={}
+          if OUT.exists():
+              try:
+                  old=json.loads(OUT.read_text(encoding="utf-8"))
+                  for r in old.get("records",[]):
+                      if r.get("date"):
+                          existing[r["date"]]=r
+              except Exception as e:
+                  print("Existing WHO JSON warning:",e)
+
+          # Known report families. WHO did not publish every single month.
+          # Try only plausible pages with short timeouts; no large PDF loop.
+          candidates=[]
+          for y in (2024,2025,2026):
+              for m in range(1,13):
+                  if y==2024 and m<4:
+                      continue
+                  if y==2026 and m>8:
+                      continue
+                  candidates.append((y,m,f"https://www.who.int/publications/m/item/herams-opt-gaza-infographics-{y}-{m:02d}"))
+                  # Some 2024 English versions use -en.
+                  if y==2024:
+                      candidates.append((y,m,f"https://www.who.int/publications/m/item/herams-opt-gaza-infographics-{y}-{m:02d}-en"))
+
+          def get(url,timeout=18):
+              r=S.get(url,timeout=timeout)
+              r.raise_for_status()
+              return r
+
+          found={}
+          page_cache={}
+          for y,m,url in candidates:
+              try:
+                  r=get(url,12)
+                  if r.status_code!=200:
+                      continue
+                  soup=BeautifulSoup(r.text,"html.parser")
+                  title=(soup.find("h1").get_text(" ",strip=True) if soup.find("h1") else "")
+                  if "HeRAMS" not in title or "Gaza" not in title:
+                      continue
+                  text=" ".join(soup.stripped_strings)
+                  dm=re.search(
+                      r"data reported up to\s+(\d{1,2})\s+"
+                      r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+                      r"(20\d{2})",
+                      text,re.I
+                  )
+                  if not dm:
+                      continue
+                  date=datetime.strptime(" ".join(dm.groups()),"%d %B %Y").date().isoformat()
+                  page_cache[date]=(url,soup)
+                  prior=existing.get(date,{})
+                  found[date]={
+                      "date":date,
+                      "title":title,
+                      "url":url,
+                      "fully_operational":prior.get("fully_operational"),
+                      "partially_operational":prior.get("partially_operational"),
+                      "not_operational":prior.get("not_operational"),
+                      "assessed_total":prior.get("assessed_total"),
+                      "note":prior.get("note") or "Official WHO HeRAMS monthly assessment."
+                  }
+              except Exception:
+                  pass
+
+          # Only ONE PDF extraction attempt per run:
+          # newest report still missing operational figures.
+          missing=[
+              d for d,r in found.items()
+              if r.get("fully_operational") is None
+              or r.get("partially_operational") is None
+              or r.get("not_operational") is None
+          ]
+          target=max(missing) if missing else None
+
+          def extract_num(pattern,text):
+              m=re.search(pattern,text,re.I|re.S)
+              if not m:
+                  return None
+              try:
+                  return int(m.group(1).replace(",",""))
+              except Exception:
+                  return None
+
+          if target:
+              url,soup=page_cache[target]
+              pdf=None
+              for a in soup.find_all("a",href=True):
+                  href=a["href"]
+                  if href.startswith("//"):
+                      href="https:"+href
+                  if href.startswith("/") and "who.int" not in href:
+                      href="https://www.who.int"+href
+                  if "cdn.who.int" in href and ".pdf" in href.lower():
+                      pdf=href
+                      break
+              if pdf:
+                  try:
+                      print("Attempting one WHO PDF:",target,pdf)
+                      pr=get(pdf,45)
+                      reader=PdfReader(io.BytesIO(pr.content))
+                      # Operational summary is normally near the beginning.
+                      text="\n".join((p.extract_text() or "") for p in reader.pages[:12])
+                      full=extract_num(r"(?:fully operational|fully functional)\D{0,45}(\d[\d,]*)",text)
+                      partial=extract_num(r"(?:partially operational|partially functional)\D{0,45}(\d[\d,]*)",text)
+                      non=extract_num(r"(?:not operational|non[- ]functional|not functioning)\D{0,45}(\d[\d,]*)",text)
+                      if all(v is not None for v in (full,partial,non)):
+                          found[target]["fully_operational"]=full
+                          found[target]["partially_operational"]=partial
+                          found[target]["not_operational"]=non
+                          found[target]["assessed_total"]=full+partial+non
+                          found[target]["note"]="Operational-status totals extracted from the official WHO HeRAMS PDF."
+                          print("Extracted operational totals:",full,partial,non)
+                      else:
+                          print("WHO PDF downloaded but status totals were not unambiguous; leaving them blank.")
+                  except Exception as e:
+                      print("WHO PDF extraction warning:",e)
+
+          records=sorted(found.values(),key=lambda r:r["date"])
+
+          if not records:
+              if OUT.exists():
+                  print("No WHO report pages validated; retaining existing file.")
+                  raise SystemExit(0)
+              raise SystemExit("No WHO records and no previous file.")
+
+          payload={
+              "generated_at":datetime.now(timezone.utc).isoformat(),
+              "source":"WHO HeRAMS",
+              "records":records
+          }
+
+          OUT.parent.mkdir(exist_ok=True)
+          tmp=OUT.with_suffix(".tmp")
+          tmp.write_text(json.dumps(payload,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          json.loads(tmp.read_text(encoding="utf-8"))
+          tmp.replace(OUT)
+          print("WHO reports:",len(records),"through",records[-1]["date"])
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/who-herams.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update WHO HeRAMS data"
+          git pull --rebase origin main
+          git push origin main
