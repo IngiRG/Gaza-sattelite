@@ -1,6 +1,14 @@
 {
-  "generated_at": "2026-08-11T12:12:00.733849+00:00",
+  "generated_at": "2026-08-16T13:39:56.295793+00:00",
   "extent_mode": "reference_zoom_11",
+  "render_version": "surface_reflectance_fixed_srgb_v1",
+  "rendering": {
+    "source": "sentinel-2-l2a surface reflectance B04/B03/B02",
+    "black_reflectance": 0.01,
+    "white_reflectance": 0.4,
+    "transfer": "sRGB",
+    "per_scene_stretch": false
+  },
   "bbox": [
     34.22,
     31.3,
