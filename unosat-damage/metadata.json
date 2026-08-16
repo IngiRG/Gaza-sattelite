@@ -1,0 +1,19 @@
+{
+  "dataset_name": "unosat-gaza-strip-comprehensive-damage-assessment-11-october-2025",
+  "dataset_title": "UNOSAT Gaza Strip Comprehensive Damage Assessment - 11 October 2025",
+  "assessment_date": "2025-10-11",
+  "dataset_url": "https://data.humdata.org/dataset/unosat-gaza-strip-comprehensive-damage-assessment-11-october-2025",
+  "resource_name": "OCHA-CBPF-OPT-031_UNOSAT_Gaza_Strip_CDA_11October2025_GDB.zip",
+  "resource_url": "https://unosat.org/static/unosat_filesystem/4213/OCHA-CBPF-OPT-031_UNOSAT_Gaza_Strip_CDA_11October2025_GDB.zip",
+  "license_title": "Creative Commons Attribution Share-Alike (CC BY-SA)",
+  "dataset_source": "UN Operational Satellite Applications Programme (UNOSAT)",
+  "fetched_at": "2026-08-16T16:02:39.362964+00:00",
+  "minzoom": 13,
+  "maxzoom": 14,
+  "layer": "unosat",
+  "feature_count": 198308,
+  "class_counts": {
+    "other": 198308
+  },
+  "note": "UNOSAT satellite-derived comprehensive building-damage assessment; preliminary analysis and not field validated."
+}
