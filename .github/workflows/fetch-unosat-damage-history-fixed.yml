@@ -1,0 +1,617 @@
+name: Build UNOSAT Gaza damage timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run weekly, after the satellite imagery workflow.
+    - cron: "20 5 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unosat-gaza-damage-history
+  cancel-in-progress: false
+
+jobs:
+  build-overlay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install geospatial tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gdal-bin unzip sqlite3 build-essential git libsqlite3-dev zlib1g-dev
+          python -m pip install --upgrade pip requests
+
+      - name: Install tippecanoe
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
+          make -C /tmp/tippecanoe -j2
+          sudo make -C /tmp/tippecanoe install
+          tippecanoe --version
+
+      - name: Build historical UNOSAT damage assessments
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/build_unosat_history.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import shutil
+          import sqlite3
+          import subprocess
+          import sys
+          import zipfile
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+
+          API = "https://data.humdata.org/api/3/action/package_search"
+          TITLE_PREFIX = "UNOSAT Gaza Strip Comprehensive Damage Assessment"
+          START_DATE = datetime(2023, 10, 7, tzinfo=timezone.utc)
+          PIPELINE_VERSION = 6
+          MIN_ZOOM = 13
+          MAX_ZOOM = 14
+          OUT = Path("unosat-damage")
+          TMP = Path("/tmp/unosat-history")
+          OUT.mkdir(exist_ok=True)
+          TMP.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({"User-Agent": "GenocideChronicle-UNOSAT-history/2.0"})
+
+          def utc_datetime(value):
+              if not value:
+                  return None
+              try:
+                  parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+                  return parsed.astimezone(timezone.utc)
+              except Exception:
+                  return None
+
+          def package_date(package):
+              title = package.get("title", "")
+              # Prefer the assessment date printed in the product title.
+              matches = re.findall(r"(\d{1,2}\s+[A-Za-z]+\s+20\d{2})", title)
+              for text in reversed(matches):
+                  for fmt in ("%d %B %Y", "%d %b %Y"):
+                      try:
+                          return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+                      except ValueError:
+                          pass
+              for key in ("dataset_date", "last_modified", "metadata_modified"):
+                  parsed = utc_datetime(package.get(key))
+                  if parsed:
+                      return parsed
+              return datetime.min.replace(tzinfo=timezone.utc)
+
+          def resource_score(resource):
+              text = " ".join(
+                  str(resource.get(k) or "")
+                  for k in ("name", "format", "description", "url")
+              ).lower()
+              score = 0
+              if "gdb" in text or "geodatabase" in text:
+                  score += 120
+              if "shp" in text or "shapefile" in text:
+                  score += 90
+              if "gpkg" in text or "geopackage" in text:
+                  score += 80
+              if "geojson" in text:
+                  score += 70
+              if ".zip" in text:
+                  score += 30
+              if "pdf" in text or ".pdf" in text:
+                  score -= 300
+              if "xlsx" in text or "csv" in text:
+                  score -= 100
+              return score
+
+          def hdx_packages():
+              response = session.get(
+                  API,
+                  params={
+                      "q": f'title:"{TITLE_PREFIX}"',
+                      "rows": 100,
+                      "sort": "metadata_modified desc",
+                  },
+                  timeout=90,
+              )
+              response.raise_for_status()
+              payload = response.json()
+              if not payload.get("success"):
+                  raise RuntimeError("HDX CKAN search failed")
+
+              packages = []
+              for package in payload["result"].get("results", []):
+                  title = (package.get("title") or "").strip()
+                  source = " ".join(
+                      [
+                          str(package.get("dataset_source") or ""),
+                          str((package.get("organization") or {}).get("title") or ""),
+                      ]
+                  ).lower()
+                  if not title.lower().startswith(TITLE_PREFIX.lower()):
+                      continue
+                  # Exclude partial-area/special-purpose products whose titles
+                  # begin with the same words but do not cover the full Strip.
+                  title_low = title.lower()
+                  if any(term in title_low for term in (
+                      "1km", "1 km", "stretch", "armistice", "demarcation",
+                      "buffer zone", "corridor", "gaza city", "agricultural",
+                      "road damage", "roads",
+                  )):
+                      continue
+                  if "unosat" not in source and "united nations satellite centre" not in source:
+                      continue
+                  date = package_date(package)
+                  if date < START_DATE or date > datetime.now(timezone.utc):
+                      continue
+                  candidates = [
+                      r for r in (package.get("resources") or [])
+                      if r.get("url") and resource_score(r) > 0
+                  ]
+                  if not candidates:
+                      print("Skipping package with no vector resource:", title)
+                      continue
+                  resource = max(candidates, key=resource_score)
+                  packages.append((date, package, resource))
+
+              # HDX can occasionally return duplicate resources/metadata records.
+              # Keep one product per assessment day, preferring the highest-scored
+              # geospatial resource.
+              by_day = {}
+              for date, package, resource in packages:
+                  key = date.date().isoformat()
+                  old = by_day.get(key)
+                  if old is None or resource_score(resource) > resource_score(old[2]):
+                      by_day[key] = (date, package, resource)
+              return [by_day[k] for k in sorted(by_day)]
+
+          def download(url, destination):
+              with session.get(url, stream=True, timeout=240) as response:
+                  response.raise_for_status()
+                  with destination.open("wb") as fh:
+                      for chunk in response.iter_content(1024 * 1024):
+                          if chunk:
+                              fh.write(chunk)
+
+          def unpack_recursive(source: Path, destination: Path):
+              destination.mkdir(parents=True, exist_ok=True)
+              if zipfile.is_zipfile(source):
+                  with zipfile.ZipFile(source) as archive:
+                      archive.extractall(destination)
+              else:
+                  shutil.copy2(source, destination / source.name)
+
+              seen = set()
+              while True:
+                  archives = [
+                      p for p in destination.rglob("*")
+                      if p.is_file() and zipfile.is_zipfile(p) and str(p) not in seen
+                  ]
+                  if not archives:
+                      break
+                  for archive in archives:
+                      seen.add(str(archive))
+                      target = archive.parent / (archive.stem + "_unzipped")
+                      target.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(archive) as zf:
+                          zf.extractall(target)
+
+          def vector_datasets(root: Path):
+              datasets = []
+              gdbs = [p for p in root.rglob("*") if p.is_dir() and p.name.lower().endswith(".gdb")]
+              datasets.extend(gdbs)
+              inside_gdb = set()
+              for gdb in gdbs:
+                  inside_gdb.update(gdb.rglob("*"))
+              for path in root.rglob("*"):
+                  if not path.is_file() or path in inside_gdb:
+                      continue
+                  if path.suffix.lower() in (".shp", ".gpkg", ".geojson", ".json", ".kml"):
+                      datasets.append(path)
+              return datasets
+
+          # UNOSAT FileGDBs often contain many unrelated infrastructure layers.
+          # Do NOT rank them merely by feature count: some releases report huge
+          # schema/estimated counts for empty Railways/Bridges/etc. layers. The
+          # building-damage layer itself is normally named Damage_Sites_* (older
+          # releases) or explicitly refers to damaged buildings/structures.
+          LAYER_BLACKLIST = (
+              "railway", "bridge", "road", "water", "agric", "field",
+              "boundary", "admin", "governorate", "hospital", "school",
+              "health", "crossing", "utility", "power", "cemetery",
+          )
+
+          def inspect_layers(dataset: Path):
+              try:
+                  text = subprocess.check_output(
+                      ["ogrinfo", "-ro", "-so", "-al", str(dataset)],
+                      text=True,
+                      stderr=subprocess.STDOUT,
+                      timeout=180,
+                  )
+              except Exception as exc:
+                  print("GDAL inspection failed:", dataset, exc)
+                  return []
+
+              candidates = []
+              chunks = re.split(r"(?=^Layer name:\s*)", text, flags=re.MULTILINE)
+              for chunk in chunks:
+                  match = re.search(r"^Layer name:\s*(.+?)\s*$", chunk, re.MULTILINE)
+                  if not match:
+                      continue
+                  layer = match.group(1).strip()
+                  name = re.sub(r"[^a-z0-9]+", "_", layer.lower()).strip("_")
+                  count_match = re.search(r"Feature Count:\s*(\d+)", chunk)
+                  count = int(count_match.group(1)) if count_match else 0
+
+                  # Empty layers are never useful, regardless of GDAL's schema
+                  # metadata. This is the exact failure mode seen in the 7 Nov
+                  # 2023 GDB, where Railways/Bridges outranked Damage_Sites.
+                  if count <= 0:
+                      continue
+                  if any(word in name for word in LAYER_BLACKLIST):
+                      continue
+
+                  schema = chunk.lower()
+                  score = count
+                  reason = []
+
+                  if "damage_sites" in name or ("damage" in name and "site" in name):
+                      score += 20_000_000
+                      reason.append("damage-sites layer name")
+                  elif "damaged" in name and ("building" in name or "structure" in name):
+                      score += 19_000_000
+                      reason.append("damaged-building layer name")
+                  elif "damage" in name and ("building" in name or "structure" in name):
+                      score += 18_000_000
+                      reason.append("building-damage layer name")
+                  elif "damage" in name:
+                      score += 12_000_000
+                      reason.append("damage layer name")
+
+                  # Schema evidence is useful for releases with generic layer
+                  # names, but is deliberately weaker than an explicit name.
+                  if "main_damage_site_class" in schema or "damage_site_class" in schema:
+                      score += 8_000_000
+                      reason.append("damage-class field")
+                  if re.search(r"\b(building|structure)[ _]?(id|class|type)?\b", schema):
+                      score += 1_000_000
+                      reason.append("building schema")
+
+                  # Require genuine damage evidence. This prevents generic large
+                  # layers from becoming candidates at all.
+                  if score < 8_000_000:
+                      continue
+
+                  candidates.append((score, count, str(dataset), layer, ", ".join(reason)))
+              return candidates
+
+          def select_layer(extracted: Path):
+              candidates = []
+              for dataset in vector_datasets(extracted):
+                  candidates.extend(inspect_layers(dataset))
+              if not candidates:
+                  raise RuntimeError("No UNOSAT Damage_Sites / building-damage vector layer could be identified")
+              candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+              print("Top building-damage layer candidates:")
+              for candidate in candidates[:8]:
+                  print(" ", candidate)
+              _, count, dataset, layer, reason = candidates[0]
+              print(f"Selected layer: {layer} ({count:,} features; {reason})")
+              return dataset, layer, count
+
+          def clean(value):
+              return re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
+
+          CODE_MAP = {
+              1: "destroyed",
+              2: "severe",
+              3: "moderate",
+              4: "possible",
+              8: "destroyed",   # Destroyed / demolition zone
+              11: "possible",  # Adjacent impact / debris
+          }
+
+          def numeric_code(value):
+              try:
+                  f = float(value)
+                  return int(f) if f.is_integer() else None
+              except Exception:
+                  return None
+
+          def text_class(value):
+              text = clean(value)
+              if not text:
+                  return None
+              if "destroyed demolition zone" in text or re.search(r"\bdestroy(?:ed)?\b|\bdestruction\b|\btotal destruction\b", text):
+                  return "destroyed"
+              if re.search(r"\bsevere(?:ly)?(?: damage| damaged)?\b|\bseverely damaged\b", text):
+                  return "severe"
+              if re.search(r"\bmoderate(?:ly)?(?: damage| damaged)?\b|\bmoderately damaged\b", text):
+                  return "moderate"
+              if "adjacent impact" in text or re.search(r"\bpossible(?: damage| damaged)?\b|\bpossibly damaged\b", text):
+                  return "possible"
+              return None
+
+          def classify(value):
+              result = text_class(value)
+              if result:
+                  return result
+              return CODE_MAP.get(numeric_code(value))
+
+          def assessment_index(field):
+              normalized = clean(field).replace(" ", "_")
+              match = re.match(r"^main_damage_site_class(?:_(\d+))?$", normalized, re.I)
+              if match:
+                  return int(match.group(1) or 1)
+              # Some releases use shorter damage-class field names. Include them
+              # only when the field name clearly describes damage classification.
+              if "damage" in normalized and "class" in normalized:
+                  suffix = re.search(r"_(\d+)$", normalized)
+                  return int(suffix.group(1)) if suffix else 1
+              return None
+
+          def normalize(raw: Path, normalized: Path):
+              fields = set()
+              values = defaultdict(Counter)
+              total = 0
+              with raw.open(encoding="utf-8") as fin:
+                  for line in fin:
+                      line = line.strip("\x1e\n\r ")
+                      if not line:
+                          continue
+                      feature = json.loads(line)
+                      props = feature.get("properties") or {}
+                      total += 1
+                      fields.update(str(k) for k in props)
+                      for key, value in props.items():
+                          if value not in (None, ""):
+                              values[str(key)][str(value)] += 1
+              if total == 0:
+                  raise RuntimeError("Selected UNOSAT layer has no features")
+
+              class_fields = []
+              for field in fields:
+                  idx = assessment_index(field)
+                  if idx is not None:
+                      # Require at least one recognizable value before trusting a
+                      # generic damage/class field.
+                      recognized = sum(
+                          count for value, count in values[field].items()
+                          if classify(value)
+                      )
+                      if recognized:
+                          class_fields.append((idx, field, recognized))
+              class_fields.sort(key=lambda item: (item[0], item[1]))
+              if not class_fields:
+                  raise RuntimeError("No usable UNOSAT damage classification fields found")
+
+              print("Damage fields oldest -> newest:")
+              for idx, field, recognized in class_fields:
+                  print(" ", idx, field, "recognized=", recognized, "values=", values[field].most_common(12))
+
+              counts = Counter()
+              source_fields = Counter()
+              unresolved = 0
+              with raw.open(encoding="utf-8") as fin, normalized.open("w", encoding="utf-8") as fout:
+                  for line in fin:
+                      line = line.strip("\x1e\n\r ")
+                      if not line:
+                          continue
+                      feature = json.loads(line)
+                      props = feature.get("properties") or {}
+                      chosen = None
+                      chosen_value = None
+                      chosen_field = None
+                      # Each comprehensive release can carry previous assessment
+                      # fields as well as the current round. For this package's
+                      # date, the latest valid value in that package is the state
+                      # known by UNOSAT at that assessment.
+                      for _, field, _ in reversed(class_fields):
+                          raw_value = props.get(field)
+                          if raw_value in (None, ""):
+                              continue
+                          candidate = classify(raw_value)
+                          if candidate:
+                              chosen = candidate
+                              chosen_value = raw_value
+                              chosen_field = field
+                              break
+                      if not chosen:
+                          unresolved += 1
+                          continue
+                      feature["properties"] = {
+                          "damage": chosen,
+                          "source_class": str(chosen_value),
+                          "source_field": str(chosen_field),
+                      }
+                      fout.write(json.dumps(feature, separators=(",", ":")) + "\n")
+                      counts[chosen] += 1
+                      source_fields[chosen_field] += 1
+
+              written = sum(counts.values())
+              if written < 1000:
+                  raise RuntimeError(f"Only {written:,} classified building-damage features were produced")
+              # A large unresolved share is acceptable because comprehensive
+              # layers can also contain no-visible-damage/non-building records;
+              # they are intentionally not published in the four-class overlay.
+              print("Input:", total, "classified:", written, "unresolved/non-damage:", unresolved)
+              print("Class counts:", dict(counts))
+              print("Source fields:", source_fields.most_common())
+              return {
+                  "input_feature_count": total,
+                  "written_feature_count": written,
+                  "unresolved_or_non_damage_count": unresolved,
+                  "class_counts": dict(counts),
+                  "assessment_fields": [field for _, field, _ in class_fields],
+              }
+
+          def build_tiles(normalized: Path, destination: Path):
+              mbtiles = normalized.with_suffix(".mbtiles")
+              subprocess.run(
+                  [
+                      "tippecanoe",
+                      "-o", str(mbtiles),
+                      "-l", "unosat",
+                      "-Z", str(MIN_ZOOM),
+                      "-z", str(MAX_ZOOM),
+                      "--no-tile-compression",
+                      "--drop-densest-as-needed",
+                      "--extend-zooms-if-still-dropping",
+                      "--include=damage",
+                      "--include=source_class",
+                      "--include=source_field",
+                      "--force",
+                      str(normalized),
+                  ],
+                  check=True,
+              )
+              if destination.exists():
+                  shutil.rmtree(destination)
+              destination.mkdir(parents=True, exist_ok=True)
+              db = sqlite3.connect(mbtiles)
+              tile_count = 0
+              for z, x, tms_y, data in db.execute(
+                  "select zoom_level,tile_column,tile_row,tile_data from tiles"
+              ):
+                  y = (1 << z) - 1 - tms_y
+                  path = destination / str(z) / str(x) / f"{y}.pbf"
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+                  tile_count += 1
+              db.close()
+              return tile_count
+
+          assessments = hdx_packages()
+          if not assessments:
+              raise SystemExit("No full-Gaza UNOSAT comprehensive damage assessments were found on HDX")
+
+          manifest_entries = []
+          discovered_dates = set()
+
+          for number, (date, package, resource) in enumerate(assessments, 1):
+              date_key = date.date().isoformat()
+              discovered_dates.add(date_key)
+              target = OUT / date_key
+              metadata_path = target / "metadata.json"
+              url = resource["url"]
+
+              existing = None
+              if metadata_path.exists():
+                  try:
+                      existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+                  except Exception:
+                      existing = None
+
+              if (
+                  existing
+                  and existing.get("pipeline_version") == PIPELINE_VERSION
+                  and existing.get("resource_url") == url
+                  and existing.get("assessment_date") == date_key
+              ):
+                  print(f"[{number}/{len(assessments)}] Reusing {date_key}: {package.get('title')}")
+                  manifest_entries.append(existing)
+                  continue
+
+              print(f"[{number}/{len(assessments)}] Building {date_key}: {package.get('title')}")
+              work = TMP / date_key
+              if work.exists():
+                  shutil.rmtree(work)
+              work.mkdir(parents=True)
+              suffix = Path(urlparse(url).path).suffix or ".bin"
+              source = work / ("source" + suffix)
+              download(url, source)
+
+              extracted = work / "extracted"
+              unpack_recursive(source, extracted)
+              dataset, layer, source_count = select_layer(extracted)
+              raw = work / "raw.geojsonseq"
+              subprocess.run(
+                  [
+                      "ogr2ogr", "-f", "GeoJSONSeq", str(raw), dataset, layer,
+                      "-t_srs", "EPSG:4326", "-lco", "RS=YES",
+                  ],
+                  check=True,
+              )
+              normalized = work / "normalized.geojsonseq"
+              diagnostics = normalize(raw, normalized)
+              tile_count = build_tiles(normalized, target)
+
+              metadata = {
+                  "pipeline_version": PIPELINE_VERSION,
+                  "assessment_date": date_key,
+                  "dataset_name": package.get("name"),
+                  "dataset_title": package.get("title"),
+                  "dataset_url": "https://data.humdata.org/dataset/" + str(package.get("name")),
+                  "dataset_source": package.get("dataset_source") or (package.get("organization") or {}).get("title"),
+                  "license_title": package.get("license_title"),
+                  "resource_name": resource.get("name"),
+                  "resource_url": url,
+                  "source_feature_count": source_count,
+                  "minzoom": MIN_ZOOM,
+                  "maxzoom": MAX_ZOOM,
+                  "layer": "unosat",
+                  "tile_count": tile_count,
+                  "classification": diagnostics,
+                  "fetched_at": datetime.now(timezone.utc).isoformat(),
+                  "note": "UNITAR/UNOSAT satellite-derived comprehensive building-damage assessment; preliminary analysis and not field validated.",
+              }
+              metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+              manifest_entries.append(metadata)
+
+          # Do not retain stale dated directories that no longer correspond to a
+          # discoverable full-Strip comprehensive assessment.
+          for child in OUT.iterdir():
+              if child.is_dir() and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", child.name):
+                  if child.name not in discovered_dates:
+                      shutil.rmtree(child)
+
+          manifest_entries.sort(key=lambda item: item["assessment_date"])
+          manifest = {
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "pipeline_version": PIPELINE_VERSION,
+              "selection_rule": "latest assessment on or before selected satellite acquisition date",
+              "minzoom": MIN_ZOOM,
+              "maxzoom": MAX_ZOOM,
+              "assessments": manifest_entries,
+          }
+          (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          print("Assessment timeline:")
+          for item in manifest_entries:
+              print(" ", item["assessment_date"], item["classification"]["class_counts"])
+          PY
+          python /tmp/build_unosat_history.py
+
+      - name: Commit overlay timeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add unosat-damage
+          git diff --cached --quiet && exit 0
+          git commit -m "Update UNOSAT Gaza damage timeline"
+          git push
