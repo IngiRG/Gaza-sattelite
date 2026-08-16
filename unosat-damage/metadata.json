@@ -7,13 +7,100 @@
   "resource_url": "https://unosat.org/static/unosat_filesystem/4213/OCHA-CBPF-OPT-031_UNOSAT_Gaza_Strip_CDA_11October2025_GDB.zip",
   "license_title": "Creative Commons Attribution Share-Alike (CC BY-SA)",
   "dataset_source": "UN Operational Satellite Applications Programme (UNOSAT)",
-  "fetched_at": "2026-08-16T16:02:39.362964+00:00",
+  "fetched_at": "2026-08-16T16:28:37.414350+00:00",
   "minzoom": 13,
   "maxzoom": 14,
   "layer": "unosat",
   "feature_count": 198308,
   "class_counts": {
-    "other": 198308
+    "destroyed": 123470,
+    "severe": 17133,
+    "moderate": 33869,
+    "possible": 23836
+  },
+  "classification": {
+    "method": "latest_valid_class_across_assessment_fields",
+    "assessment_fields": [
+      {
+        "index": 1,
+        "field": "Main_Damage_Site_Class"
+      },
+      {
+        "index": 2,
+        "field": "Main_Damage_Site_Class_2"
+      },
+      {
+        "index": 3,
+        "field": "Main_Damage_Site_Class_3"
+      },
+      {
+        "index": 4,
+        "field": "Main_Damage_Site_Class_4"
+      },
+      {
+        "index": 5,
+        "field": "Main_Damage_Site_Class_5"
+      },
+      {
+        "index": 6,
+        "field": "Main_Damage_Site_Class_6"
+      },
+      {
+        "index": 7,
+        "field": "Main_Damage_Site_Class_7"
+      },
+      {
+        "index": 8,
+        "field": "Main_Damage_Site_Class_8"
+      },
+      {
+        "index": 9,
+        "field": "Main_Damage_Site_Class_9"
+      },
+      {
+        "index": 10,
+        "field": "Main_Damage_Site_Class_10"
+      },
+      {
+        "index": 11,
+        "field": "Main_Damage_Site_Class_11"
+      },
+      {
+        "index": 12,
+        "field": "Main_Damage_Site_Class_12"
+      },
+      {
+        "index": 13,
+        "field": "Main_Damage_Site_Class_13"
+      },
+      {
+        "index": 14,
+        "field": "Main_Damage_Site_Class_14"
+      }
+    ],
+    "group_field": "Grouped_Damage_Classes",
+    "input_feature_count": 198308,
+    "building_feature_count": 198308,
+    "written_feature_count": 198308,
+    "class_counts": {
+      "destroyed": 123470,
+      "severe": 17133,
+      "moderate": 33869,
+      "possible": 23836
+    },
+    "unclassified_count": 0,
+    "unclassified_rate": 0.0,
+    "classification_source_fields": {
+      "Main_Damage_Site_Class_14": 198273,
+      "Main_Damage_Site_Class_7": 4,
+      "Main_Damage_Site_Class_5": 2,
+      "Main_Damage_Site_Class_4": 1,
+      "Main_Damage_Site_Class_12": 2,
+      "Main_Damage_Site_Class_9": 10,
+      "Main_Damage_Site_Class_6": 1,
+      "Main_Damage_Site_Class_10": 10,
+      "Main_Damage_Site_Class_8": 5
+    }
   },
   "note": "UNOSAT satellite-derived comprehensive building-damage assessment; preliminary analysis and not field validated."
 }
