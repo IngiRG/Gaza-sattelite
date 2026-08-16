@@ -1,0 +1,459 @@
+name: Generate monthly satellite timeline
+
+on:
+  workflow_dispatch:
+  schedule:
+  - cron: "30 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tile generator
+        run: pip install requests rio-tiler pillow numpy shapely
+      - name: Generate monthly tiles
+        shell: bash
+        run: |
+          cat > /tmp/generate_monthly.py <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import calendar, json, math, shutil, sys, requests
+          import numpy as np
+          from PIL import Image
+          from rio_tiler.io import COGReader
+          from shapely.geometry import box, shape
+          from shapely.ops import unary_union
+
+          SEARCH="https://earth-search.aws.element84.com/v1/search"
+          ITEM="https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a/items"
+          BEFORE_ID="S2A_36RXV_20230927_0_L2A"
+          BBOX=(34.22,31.30,34.60,31.67)
+          ZOOMS=range(8,15)
+          OUT=Path("tiles")
+
+          # Rendering version. Bump this whenever the radiometric/display
+          # pipeline changes so existing WebP tiles are rebuilt once.
+          RENDER_VERSION="surface_reflectance_fixed_srgb_v1"
+
+          # One fixed display transform for every acquisition. These values
+          # are intentionally NOT calculated per image/month: per-scene
+          # histogram stretching would make dates look artificially similar
+          # and weaken before/after comparison. Values are surface reflectance.
+          DISPLAY_BLACK=0.01
+          DISPLAY_WHITE=0.40
+
+          # The visible satellite footprint is snapped to the tile grid at
+          # zoom 11 (the normal zoomed-out viewing level). Every other zoom
+          # is cropped/generated to this same geographic rectangle.
+          REFERENCE_ZOOM=11
+
+          def raw_lonx(lon,z):
+              return int((lon+180.0)/360.0*(1<<z))
+
+          def raw_laty(lat,z):
+              radians=math.radians(lat)
+              return int((1-math.asinh(math.tan(radians))/math.pi)/2.0*(1<<z))
+
+          def tile_west(x,z):
+              return x/(1<<z)*360.0-180.0
+
+          def tile_north(y,z):
+              n=math.pi*(1.0-2.0*y/(1<<z))
+              return math.degrees(math.atan(math.sinh(n)))
+
+          bw,bs,be,bn=BBOX
+          ref_x0=raw_lonx(bw,REFERENCE_ZOOM)
+          ref_x1=raw_lonx(be,REFERENCE_ZOOM)
+          ref_y0=raw_laty(bn,REFERENCE_ZOOM)
+          ref_y1=raw_laty(bs,REFERENCE_ZOOM)
+
+          DISPLAY_BBOX=(
+              tile_west(ref_x0,REFERENCE_ZOOM),
+              tile_north(ref_y1+1,REFERENCE_ZOOM),
+              tile_west(ref_x1+1,REFERENCE_ZOOM),
+              tile_north(ref_y0,REFERENCE_ZOOM),
+          )
+
+          # Search farther than the displayed area so neighbouring same-day
+          # Sentinel-2 granules can fill its edges.
+          SEARCH_BBOX=(
+              DISPLAY_BBOX[0]-0.15,
+              DISPLAY_BBOX[1]-0.15,
+              DISPLAY_BBOX[2]+0.15,
+              DISPLAY_BBOX[3]+0.15,
+          )
+
+          AOI=box(*DISPLAY_BBOX)
+
+          def get_item(item_id):
+              r=requests.get(f"{ITEM}/{item_id}",timeout=90);r.raise_for_status();return r.json()
+          def search_month(year,month):
+              last=calendar.monthrange(year,month)[1]
+              params={"collections":"sentinel-2-l2a","bbox":",".join(map(str,SEARCH_BBOX)),"datetime":f"{year:04d}-{month:02d}-01T00:00:00Z/{year:04d}-{month:02d}-{last:02d}T23:59:59Z","limit":"100"}
+              r=requests.get(SEARCH,params=params,timeout=90);r.raise_for_status();return r.json().get("features",[])
+          def visual(item):
+              # Kept for manifest/source links only. Rendering below uses the
+              # calibrated red/green/blue surface-reflectance assets instead.
+              for key in ("visual","tci","TCI","visual-jp2"):
+                  if key in item.get("assets",{}): return item["assets"][key]["href"]
+              return None
+
+          def rgb_assets(item):
+              assets=item.get("assets",{})
+              aliases={
+                  "red":("red","B04","b04"),
+                  "green":("green","B03","b03"),
+                  "blue":("blue","B02","b02"),
+              }
+              result={}
+              for band,names in aliases.items():
+                  for name in names:
+                      asset=assets.get(name)
+                      if asset and asset.get("href"):
+                          result[band]=asset
+                          break
+              return result if len(result)==3 else None
+
+          def asset_scale_offset(asset):
+              # Earth Search exposes raster scale/offset metadata when needed.
+              # Honour it so products from different Sentinel processing
+              # baselines are converted onto the same reflectance scale.
+              bands=asset.get("raster:bands") or []
+              meta=bands[0] if bands else {}
+              scale=meta.get("scale",asset.get("scale"))
+              offset=meta.get("offset",asset.get("offset"))
+              if scale is None:
+                  # Sentinel-2 L2A reflectance DN quantification fallback.
+                  scale=0.0001
+              if offset is None:
+                  offset=0.0
+              return float(scale),float(offset)
+
+          def cloud(item): return float(item.get("properties",{}).get("eo:cloud_cover",999))
+          def dt(item): return item["properties"].get("datetime") or item["properties"].get("start_datetime")
+          def choose_month(items):
+              valid=[
+                  item for item in items
+                  if rgb_assets(item) and item.get("geometry") and dt(item)
+              ]
+              if not valid:
+                  return None
+
+              grouped={}
+              for item in valid:
+                  day=dt(item)[:10]
+                  grouped.setdefault(day,[]).append(item)
+
+              candidates=[]
+              for day,day_items in grouped.items():
+                  pieces=[]
+                  weighted_cloud=0.0
+                  total_area=0.0
+
+                  for item in day_items:
+                      try:
+                          part=shape(item["geometry"]).intersection(AOI)
+                      except Exception:
+                          continue
+
+                      if part.is_empty:
+                          continue
+
+                      pieces.append(part)
+                      area=part.area
+                      weighted_cloud+=cloud(item)*area
+                      total_area+=area
+
+                  if not pieces:
+                      continue
+
+                  coverage=min(1.0,unary_union(pieces).area/AOI.area)
+                  avg_cloud=weighted_cloud/total_area if total_area else 999.0
+
+                  candidates.append({
+                      "day":day,
+                      "items":day_items,
+                      "coverage":coverage,
+                      "cloud":avg_cloud
+                  })
+
+              if not candidates:
+                  return None
+
+              # Prefer acquisition dates that cover essentially all Gaza.
+              full=[c for c in candidates if c["coverage"]>=0.995]
+
+              if full:
+                  # Among fully covering dates, choose the least cloudy.
+                  full.sort(key=lambda c:(c["cloud"],c["day"]))
+                  return full[0]
+
+              # If no date fully covers the BBOX, choose the date with the
+              # greatest coverage; cloud cover breaks ties.
+              candidates.sort(
+                  key=lambda c:(-c["coverage"],c["cloud"],c["day"])
+              )
+              return candidates[0]
+          def month_keys():
+              now=datetime.now(timezone.utc);year,month=2023,10
+              while (year,month)<=(now.year,now.month):
+                  yield f"{year:04d}-{month:02d}",year,month
+                  month+=1
+                  if month==13:year+=1;month=1
+          def lonx(lon,z): return raw_lonx(lon,z)
+          def laty(lat,z): return raw_laty(lat,z)
+          def coords():
+              west,south,east,north=DISPLAY_BBOX
+              for z in ZOOMS:
+                  for x in range(lonx(west,z),lonx(east,z)+1):
+                      for y in range(laty(north,z),laty(south,z)+1):
+                          yield z,x,y
+          TILE_COORDS=list(coords())
+          def display_mask(x,y,z):
+              size=256
+              world=size*(1<<z)
+
+              px=x*size+np.arange(size)+0.5
+              py=y*size+np.arange(size)+0.5
+
+              lon=px/world*360.0-180.0
+              merc=np.pi*(1.0-2.0*py/world)
+              lat=np.degrees(np.arctan(np.sinh(merc)))
+
+              west,south,east,north=DISPLAY_BBOX
+              return (
+                  ((lat>=south)&(lat<=north))[:,None]
+                  &
+                  ((lon>=west)&(lon<=east))[None,:]
+              )
+
+          def read_band_tile(reader,x,y,z,scale,offset):
+              try:
+                  image=reader.tile(x,y,z,tilesize=256)
+              except Exception:
+                  return None,None
+
+              data=np.asarray(image.data)
+              if data.ndim==3:
+                  data=data[0]
+              data=data.astype(np.float32)*scale+offset
+
+              mask=np.asarray(image.mask)
+              if mask.ndim==3:
+                  mask=mask[0]
+
+              return data,mask>0
+
+          def linear_to_srgb(x):
+              # Standard sRGB transfer function. Input is normalized linear
+              # surface reflectance after applying the fixed black/white range.
+              x=np.clip(x,0.0,1.0)
+              return np.where(
+                  x<=0.0031308,
+                  12.92*x,
+                  1.055*np.power(x,1.0/2.4)-0.055
+              )
+
+          def reflectance_to_u8(rgb):
+              x=(rgb-DISPLAY_BLACK)/(DISPLAY_WHITE-DISPLAY_BLACK)
+              x=linear_to_srgb(x)
+              return np.clip(np.rint(x*255.0),0,255).astype(np.uint8)
+
+          def render(label,items,force=False):
+              folder=OUT/label
+              if force and folder.exists():
+                  shutil.rmtree(folder)
+
+              folder.mkdir(parents=True,exist_ok=True)
+
+              readers=[]
+              try:
+                  for item in items:
+                      assets=rgb_assets(item)
+                      if not assets:
+                          continue
+                      entry={}
+                      for band in ("red","green","blue"):
+                          asset=assets[band]
+                          entry[band]={
+                              "reader":COGReader(asset["href"]),
+                              "scale_offset":asset_scale_offset(asset),
+                          }
+                      readers.append(entry)
+
+                  if not readers:
+                      raise RuntimeError(f"No RGB surface-reflectance assets for {label}")
+
+                  for number,(z,x,y) in enumerate(TILE_COORDS,1):
+                      path=folder/str(z)/str(x)/f"{y}.webp"
+
+                      if path.exists() and path.stat().st_size>100:
+                          continue
+
+                      # Work in calibrated surface reflectance until the
+                      # very end. This avoids relying on each product's premade
+                      # 8-bit TCI/visual rendering, which can look inconsistent
+                      # across dates and processing baselines.
+                      rgb_ref=np.zeros((3,256,256),dtype=np.float32)
+                      valid=np.zeros((256,256),dtype=bool)
+
+                      # Every reader group is from the same acquisition date.
+                      # Fill only pixels not already supplied by another
+                      # same-day Sentinel-2 granule. A pixel is accepted only
+                      # when all three RGB bands are valid.
+                      for entry in readers:
+                          bands=[]
+                          masks=[]
+                          failed=False
+                          for band in ("red","green","blue"):
+                              reader=entry[band]["reader"]
+                              scale,offset=entry[band]["scale_offset"]
+                              data,mask=read_band_tile(reader,x,y,z,scale,offset)
+                              if data is None:
+                                  failed=True
+                                  break
+                              bands.append(data)
+                              masks.append(mask)
+                          if failed:
+                              continue
+
+                          data=np.stack(bands,axis=0)
+                          mask=masks[0] & masks[1] & masks[2]
+                          take=mask & ~valid
+                          if np.any(take):
+                              rgb_ref[:,take]=data[:,take]
+                              valid|=take
+
+                          if np.all(valid):
+                              break
+
+                      rgb=reflectance_to_u8(rgb_ref)
+
+                      # Force every zoom level to the exact same
+                      # geographic display footprint.
+                      valid &= display_mask(x,y,z)
+
+                      rgba=np.zeros((256,256,4),dtype=np.uint8)
+                      rgba[:,:,:3]=np.moveaxis(rgb,0,2)
+                      rgba[:,:,3]=valid.astype(np.uint8)*255
+
+                      # Always write the tile so Leaflet never gets a 404.
+                      path.parent.mkdir(parents=True,exist_ok=True)
+                      Image.fromarray(rgba).save(
+                          path,
+                          "WEBP",
+                          quality=78,
+                          method=4
+                      )
+
+                      if number%100==0:
+                          print(label,number,len(TILE_COORDS))
+
+              finally:
+                  for entry in readers:
+                      for band in ("red","green","blue"):
+                          try:
+                              entry[band]["reader"].close()
+                          except Exception:
+                              pass
+
+          OUT.mkdir(exist_ok=True);manifest_path=OUT/"manifest.json";old_manifest={}
+          if manifest_path.exists():
+              try:old_manifest=json.loads(manifest_path.read_text())
+              except Exception:old_manifest={}
+          before_item=get_item(BEFORE_ID)
+          before_day=dt(before_item)[:10]
+          before_items=[
+              item for item in search_month(2023,9)
+              if rgb_assets(item) and dt(item) and dt(item)[:10]==before_day
+          ]
+          if not before_items:
+              before_items=[before_item]
+          before_ids=sorted(item["id"] for item in before_items)
+          old_before_ids=old_manifest.get("before",{}).get("source_ids",[])
+          render_changed=(old_manifest.get("render_version")!=RENDER_VERSION)
+          render(
+              "before",
+              before_items,
+              force=(
+                  render_changed
+                  or old_manifest.get("extent_mode")!="reference_zoom_11"
+                  or old_before_ids!=before_ids
+              )
+          )
+          manifest={
+              "generated_at":datetime.now(timezone.utc).isoformat(),
+              "extent_mode":"reference_zoom_11",
+              "render_version":RENDER_VERSION,
+              "rendering":{
+                  "source":"sentinel-2-l2a surface reflectance B04/B03/B02",
+                  "black_reflectance":DISPLAY_BLACK,
+                  "white_reflectance":DISPLAY_WHITE,
+                  "transfer":"sRGB",
+                  "per_scene_stretch":False
+              },
+              "bbox":BBOX,
+              "display_bbox":DISPLAY_BBOX,
+              "search_bbox":SEARCH_BBOX,
+              "zooms":[min(ZOOMS),max(ZOOMS)],
+              "before":{
+                  "id":before_item["id"],
+                  "datetime":dt(before_item),
+                  "cloud":cloud(before_item),
+                  "href":visual(before_item),
+                  "source_ids":before_ids
+              },
+              "months":{}
+          }
+          for key,year,month in month_keys():
+              selected=choose_month(search_month(year,month))
+              if selected is None:
+                  continue
+
+              source_ids=sorted(
+                  item["id"] for item in selected["items"]
+              )
+              representative=sorted(
+                  selected["items"],
+                  key=lambda item:item["id"]
+              )[0]
+
+              previous=old_manifest.get("months",{}).get(key,{})
+              render(
+                  f"monthly/{key}",
+                  selected["items"],
+                  force=(
+                      render_changed
+                      or old_manifest.get("extent_mode")!="reference_zoom_11"
+                      or previous.get("source_ids",[])!=source_ids
+                  )
+              )
+
+              manifest["months"][key]={
+                  "id":representative["id"],
+                  "datetime":dt(representative),
+                  "cloud":selected["cloud"],
+                  "href":visual(representative),
+                  "coverage":selected["coverage"],
+                  "source_ids":source_ids
+              }
+              manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+          manifest_path.write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+          PY
+          python /tmp/generate_monthly.py
+      - name: Commit generated timeline
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tiles
+          git diff --cached --quiet && exit 0
+          git commit -m "Update monthly satellite timeline"
+          git push
