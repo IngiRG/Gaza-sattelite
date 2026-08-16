@@ -1,0 +1,34 @@
+{
+  "pipeline_version": 6,
+  "assessment_date": "2023-11-26",
+  "dataset_name": "unosat-gaza-strip-comprehensive-damage-assessment-26-november-2023",
+  "dataset_title": "UNOSAT Gaza Strip Comprehensive Damage Assessment - 26 November 2023",
+  "dataset_url": "https://data.humdata.org/dataset/unosat-gaza-strip-comprehensive-damage-assessment-26-november-2023",
+  "dataset_source": "UN Operational Satellite Applications Programme (UNOSAT)",
+  "license_title": "Creative Commons Attribution Share-Alike (CC BY-SA)",
+  "resource_name": "UNOSAT_GazaStrip_CDA_26November2023_GDB.zip",
+  "resource_url": "https://unosat.org/static/unosat_filesystem/3769/UNOSAT_GazaStrip_CDA_26November2023_GDB.zip",
+  "source_feature_count": 37379,
+  "minzoom": 13,
+  "maxzoom": 14,
+  "layer": "unosat",
+  "tile_count": 155,
+  "classification": {
+    "input_feature_count": 37379,
+    "written_feature_count": 37379,
+    "unresolved_or_non_damage_count": 0,
+    "class_counts": {
+      "destroyed": 10049,
+      "moderate": 19087,
+      "severe": 8243
+    },
+    "assessment_fields": [
+      "Grouped_Damage_Classes",
+      "Main_Damage_Site_Class",
+      "Main_Damage_Site_Class_2",
+      "Main_Damage_Site_Class_3"
+    ]
+  },
+  "fetched_at": "2026-08-16T16:56:22.108188+00:00",
+  "note": "UNITAR/UNOSAT satellite-derived comprehensive building-damage assessment; preliminary analysis and not field validated."
+}

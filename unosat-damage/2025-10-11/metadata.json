@@ -1,0 +1,46 @@
+{
+  "pipeline_version": 6,
+  "assessment_date": "2025-10-11",
+  "dataset_name": "unosat-gaza-strip-comprehensive-damage-assessment-11-october-2025",
+  "dataset_title": "UNOSAT Gaza Strip Comprehensive Damage Assessment - 11 October 2025",
+  "dataset_url": "https://data.humdata.org/dataset/unosat-gaza-strip-comprehensive-damage-assessment-11-october-2025",
+  "dataset_source": "UN Operational Satellite Applications Programme (UNOSAT)",
+  "license_title": "Creative Commons Attribution Share-Alike (CC BY-SA)",
+  "resource_name": "OCHA-CBPF-OPT-031_UNOSAT_Gaza_Strip_CDA_11October2025_GDB.zip",
+  "resource_url": "https://unosat.org/static/unosat_filesystem/4213/OCHA-CBPF-OPT-031_UNOSAT_Gaza_Strip_CDA_11October2025_GDB.zip",
+  "source_feature_count": 198308,
+  "minzoom": 13,
+  "maxzoom": 14,
+  "layer": "unosat",
+  "tile_count": 157,
+  "classification": {
+    "input_feature_count": 198308,
+    "written_feature_count": 198308,
+    "unresolved_or_non_damage_count": 0,
+    "class_counts": {
+      "destroyed": 123470,
+      "moderate": 33869,
+      "severe": 17133,
+      "possible": 23836
+    },
+    "assessment_fields": [
+      "Grouped_Damage_Classes",
+      "Main_Damage_Site_Class",
+      "Main_Damage_Site_Class_2",
+      "Main_Damage_Site_Class_3",
+      "Main_Damage_Site_Class_4",
+      "Main_Damage_Site_Class_5",
+      "Main_Damage_Site_Class_6",
+      "Main_Damage_Site_Class_7",
+      "Main_Damage_Site_Class_8",
+      "Main_Damage_Site_Class_9",
+      "Main_Damage_Site_Class_10",
+      "Main_Damage_Site_Class_11",
+      "Main_Damage_Site_Class_12",
+      "Main_Damage_Site_Class_13",
+      "Main_Damage_Site_Class_14"
+    ]
+  },
+  "fetched_at": "2026-08-16T16:58:21.044127+00:00",
+  "note": "UNITAR/UNOSAT satellite-derived comprehensive building-damage assessment; preliminary analysis and not field validated."
+}

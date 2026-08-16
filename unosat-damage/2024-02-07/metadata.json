@@ -1,0 +1,35 @@
+{
+  "pipeline_version": 6,
+  "assessment_date": "2024-02-07",
+  "dataset_name": "unosat-gaza-strip-comprehensive-damage-assessment-january-2024",
+  "dataset_title": "UNOSAT Gaza Strip Comprehensive Damage Assessment - January 2024",
+  "dataset_url": "https://data.humdata.org/dataset/unosat-gaza-strip-comprehensive-damage-assessment-january-2024",
+  "dataset_source": "UN Operational Satellite Applications Programme (UNOSAT)",
+  "license_title": "Creative Commons Attribution Share-Alike (CC BY-SA)",
+  "resource_name": "UNOSAT_GazaStrip_CDA_January2024_GDB_V2.zip",
+  "resource_url": "https://unosat.org/static/unosat_filesystem/3793/UNOSAT_GazaStrip_CDA_January2024_GDB_V2.zip",
+  "source_feature_count": 69146,
+  "minzoom": 13,
+  "maxzoom": 14,
+  "layer": "unosat",
+  "tile_count": 157,
+  "classification": {
+    "input_feature_count": 69146,
+    "written_feature_count": 69146,
+    "unresolved_or_non_damage_count": 0,
+    "class_counts": {
+      "destroyed": 22130,
+      "moderate": 32950,
+      "severe": 14066
+    },
+    "assessment_fields": [
+      "Grouped_Damage_Classes",
+      "Main_Damage_Site_Class",
+      "Main_Damage_Site_Class_2",
+      "Main_Damage_Site_Class_3",
+      "Main_Damage_Site_Class_4"
+    ]
+  },
+  "fetched_at": "2026-08-16T16:56:28.625826+00:00",
+  "note": "UNITAR/UNOSAT satellite-derived comprehensive building-damage assessment; preliminary analysis and not field validated."
+}
