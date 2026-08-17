@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-16T13:39:56.295793+00:00",
+  "generated_at": "2026-08-17T04:20:25.555680+00:00",
   "extent_mode": "reference_zoom_11",
   "render_version": "surface_reflectance_fixed_srgb_v1",
   "rendering": {
@@ -481,19 +481,19 @@
       ]
     },
     "2026-07": {
-      "id": "S2A_36RWV_20260718_1_L2A",
-      "datetime": "2026-07-18T08:41:47.561000Z",
-      "cloud": 0.07503544114376269,
-      "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/WV/2026/7/S2A_36RWV_20260718_1_L2A/TCI.tif",
+      "id": "S2A_36RWV_20260728_1_L2A",
+      "datetime": "2026-07-28T08:41:48.404000Z",
+      "cloud": 0.026756305014144617,
+      "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/36/R/WV/2026/7/S2A_36RWV_20260728_1_L2A/TCI.tif",
       "coverage": 1.0,
       "source_ids": [
-        "S2A_36RWV_20260718_1_L2A",
-        "S2A_36SWA_20260718_1_L2A",
-        "S2A_36SXA_20260718_1_L2A",
-        "S2B_36RWV_20260718_0_L2A",
-        "S2B_36RXV_20260718_0_L2A",
-        "S2B_36SWA_20260718_0_L2A",
-        "S2B_36SXA_20260718_0_L2A"
+        "S2A_36RWV_20260728_1_L2A",
+        "S2A_36SWA_20260728_1_L2A",
+        "S2A_36SXA_20260728_0_L2A",
+        "S2B_36RWV_20260728_0_L2A",
+        "S2B_36RXV_20260728_0_L2A",
+        "S2B_36SWA_20260728_0_L2A",
+        "S2B_36SXA_20260728_1_L2A"
       ]
     },
     "2026-08": {
