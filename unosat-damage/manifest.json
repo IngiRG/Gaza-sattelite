@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-16T13:43:47.547489+00:00",
+  "generated_at": "2026-11-23T16:12:42.038994+00:00",
   "pipeline_version": 6,
   "selection_rule": "latest assessment on or before selected satellite acquisition date",
   "minzoom": 13,
